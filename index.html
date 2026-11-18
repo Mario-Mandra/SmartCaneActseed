@@ -12,72 +12,176 @@
     #main { position: fixed; inset: 0; width: 100%; height: 100%; border: 0;
             padding: 0; background: #000; color: #fff; cursor: pointer; }
     #main:focus-visible { outline: 6px solid #ff0; outline-offset: -6px; }
-    video, canvas { position: absolute; inset: 0; width: 100%; height: 100%;
-                    object-fit: cover; }
+    #main video, #main canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+                                object-fit: cover; }
     #label { position: absolute; left: 0; right: 0; bottom: 8%; padding: 1rem;
              font-size: 2rem; font-weight: 700; text-align: center;
              background: rgba(0,0,0,.65); }
+    #cane { position: absolute; left: 0; right: 0; top: 0; padding: .5rem;
+            font-size: 1.4rem; text-align: center; background: rgba(0,0,0,.65); }
     .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden;
                clip: rect(0 0 0 0); white-space: nowrap; }
+
+    /* ---------- Developer dashboard (?debug=1) ---------- */
+    #dash { display: none; }
+    body.debug { height: auto; background: #111; font: 13px/1.35 ui-monospace, Consolas, monospace; }
+    body.debug #main { display: none; }
+    body.debug #dash { display: block; padding: 6px; }
+    #bar { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 6px;
+           padding: 6px; background: #222; border-bottom: 1px solid #444; }
+    #bar button { font: inherit; padding: 8px 12px; background: #333; color: #fff;
+                  border: 1px solid #666; border-radius: 4px; }
+    #grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+    .panel { background: #1a1a1a; border: 1px solid #333; border-radius: 4px; padding: 6px; }
+    .panel h3 { margin: 0 0 4px; font-size: 12px; color: #9cf; font-weight: 600; }
+    .panel canvas { width: 100%; display: block; }
+    #view { position: relative; width: 100%; aspect-ratio: 3 / 4; background: #000; }
+    #view video, #view canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+    #stats { white-space: pre; overflow-x: auto; }
+    #tracks { width: 100%; border-collapse: collapse; font-size: 11px; }
+    #tracks td, #tracks th { border-bottom: 1px solid #333; padding: 2px 3px; text-align: left; white-space: nowrap; }
+    #log { height: 220px; overflow-y: auto; white-space: pre-wrap; font-size: 11px; }
+    .ctl { display: grid; grid-template-columns: 110px 1fr 60px; gap: 4px; align-items: center; }
+    .ctl input { width: 100%; }
+    #urlOut { word-break: break-all; color: #9f9; font-size: 11px; }
   </style>
 </head>
 <body>
+  <!-- User mode: the whole screen is one button (TalkBack: double-tap). -->
   <button id="main" type="button">
     <video id="video" playsinline muted aria-hidden="true"></video>
     <canvas id="overlay" aria-hidden="true"></canvas>
+    <span id="cane" aria-hidden="true"></span>
     <span id="label">Pornește detectarea</span>
   </button>
   <div id="live" class="sr-only" aria-live="assertive" aria-atomic="true"></div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+  <!-- Developer dashboard: only with ?debug=1 -->
+  <div id="dash" lang="en">
+    <div id="bar">
+      <button id="bStart" type="button">Start camera</button>
+      <button id="bCane" type="button">Connect cane</button>
+      <button id="bVoice" type="button">Voice: on</button>
+      <button id="bExport" type="button">Export log (JSON)</button>
+    </div>
+    <div id="grid">
+      <div class="panel"><h3>Camera + detections (grey dashed = seen by the model, filtered out)</h3><div id="view"></div></div>
+      <div class="panel"><h3>Top-down map (you at the bottom, metres)</h3><canvas id="radar" height="360"></canvas></div>
+      <div class="panel"><h3>Cane sensor – last 10 s (slant cm)</h3><canvas id="caneplot" height="220"></canvas></div>
+      <div class="panel"><h3>Cane sensor – side view</h3><canvas id="side" height="200"></canvas></div>
+      <div class="panel"><h3>Status</h3><div id="stats"></div></div>
+      <div class="panel"><h3>Tuning (live)</h3><div id="controls"></div><div id="urlOut"></div></div>
+      <div class="panel" style="grid-column: 1 / -1"><h3>Tracks</h3><div style="overflow-x:auto"><table id="tracks"></table></div></div>
+      <div class="panel" style="grid-column: 1 / -1"><h3>Log (spoken + decisions)</h3><div id="log"></div></div>
+    </div>
+  </div>
+
   <script>
-  // ---- Settings (tune here) ----
-  const MIN_SCORE   = 0.6;    // confidence threshold
-  const COOLDOWN_MS = 3500;   // same object is not repeated before this
-  const LOOP_MS     = 300;    // pause between detections (battery)
-  const NEAR_RATIO  = 0.5;    // box taller than half the frame = "aproape"
-  // ?voce=1 -> also speak with speechSynthesis (for demos without TalkBack)
-  const USE_VOICE = new URLSearchParams(location.search).get('voce') === '1';
+  // Baston v4 — Team 05.
+  // Phone camera -> object detector (MediaPipe EfficientDet-Lite, fallback COCO-SSD) -> tracking with
+  // class voting -> distance from object height AND from where it touches the ground (phone tilt sensor)
+  // -> polar position -> THE LIST -> only what matters is spoken.
+  // Cane over Bluetooth (?baston=1): its measured distance names the object in front, corrects the
+  // camera's distance scale over time, and gives "Obstacol" when the camera can't name what the cane feels.
+  // ?debug=1 = developer dashboard. Frames are processed in memory only, never stored or sent.
 
-  // Only obstacle-relevant COCO classes are announced, in Romanian.
-  const RO = {
-    'person': 'Persoană', 'bicycle': 'Bicicletă', 'car': 'Mașină',
-    'motorcycle': 'Motocicletă', 'bus': 'Autobuz', 'truck': 'Camion',
-    'traffic light': 'Semafor', 'fire hydrant': 'Hidrant',
-    'stop sign': 'Indicator stop', 'parking meter': 'Parcometru',
-    'bench': 'Bancă', 'chair': 'Scaun', 'couch': 'Canapea',
-    'dining table': 'Masă', 'potted plant': 'Ghiveci', 'dog': 'Câine',
-    'cat': 'Pisică', 'suitcase': 'Valiză', 'backpack': 'Rucsac',
-    'umbrella': 'Umbrelă', 'bed': 'Pat', 'toilet': 'Toaletă', 'tv': 'Televizor'
+  // ================= Settings =================
+  const params = new URLSearchParams(location.search);
+  const num = (k, d) => (params.has(k) && params.get(k) !== '' && !isNaN(+params.get(k))) ? +params.get(k) : d;
+  const DEBUG     = params.get('debug') === '1';
+  const USE_CANE  = params.get('baston') === '1';
+  const MODEL     = params.get('model') || 'lite0';           // lite0 | lite2 | ssd
+  let USE_VOICE   = params.get('voce') === '1' || DEBUG;
+  let VFOV_DEG    = num('fov', 0);        // camera vertical field of view (portrait); 0 = auto 64°
+  let CORRIDOR_HALF_M = num('lat', 0.5);  // half the width of my walking path
+  let CAM_OFFSET_M    = num('off', 0);    // camera right of body centre (+) / left (-)
+  let CAM_H_M         = num('h', 1.0);    // camera lens height above the floor (belt)
+  let SCORE_BIAS      = num('bias', 0);   // added to every class threshold (+ = stricter)
+  let camScale        = num('scale', 1);  // camera distance correction, learned from the cane
+
+  const LOOP_MS_FAST = 15, LOOP_MS_SLOW = 100;
+  const CONFIRM_HITS = 2, MAX_MISSES = 5;
+  const GAP_MS = 1500, SAME_TRACK_MS = 2500, NEAR_REPEAT_MS = 5000, CLASS_MEMORY_MS = 8000;
+  const NEAR_M = 1.5;
+  const YAW_TOL_DEG = 5, AHEAD_DEG = 12;
+  const APPROACH_MAX_M = 10, INFO_MEMORY_MS = 30000;
+
+  // Cane
+  const SVC_UUID  = 'ec8422ab-c76c-4afc-ab70-bbfa0dda990f';
+  const DIST_UUID = '6bbc5371-56f1-40b2-a7f2-6d62bc96311e';
+  const DBG_UUID  = '9d67ed6f-8121-4095-a5e4-d8d4bb529560';
+  const CANE_BODY_M = 0.35;     // must match BODY_OFFSET_CM in the firmware
+  const SWEEP_MS = 700, UNKNOWN_M = 1.5, UNKNOWN_HOLD_MS = 600, UNKNOWN_REARM_MS = 2000;
+  const FUSE_MAX_RATIO = 1.8;   // camera estimate must be within x1.8 of the cane to be matched
+
+  // ===== THE LIST =====
+  // rule 'path' = only when in my way / about to be touched; 'moving' = in my way or approaching;
+  // 'info' = landmark, once per 30 s. max = ignore beyond (m). minScore = detector confidence needed.
+  // group = classes the detector confuses with each other; a track keeps the majority vote.
+  //                  Romanian         height prio moves rule     max  minScore group
+  const CLASSES = {
+    'person':        ['Persoană',      1.7,  2, true,  'moving', 3,   0.50, 'person'],
+    'bicycle':       ['Bicicletă',     1.0,  3, true,  'moving', 6,   0.45, 'twowheel'],
+    'motorcycle':    ['Motocicletă',   1.1,  3, true,  'moving', 8,   0.45, 'twowheel'],
+    'car':           ['Mașină',        1.5,  3, true,  'moving', 4,   0.50, 'vehicle'],
+    'bus':           ['Autobuz',       3.0,  3, true,  'moving', 6,   0.50, 'vehicle'],
+    'truck':         ['Camion',        3.0,  3, true,  'moving', 6,   0.50, 'vehicle'],
+    'dog':           ['Câine',         0.55, 2, true,  'moving', 3,   0.50, 'dog'],
+    'traffic light': ['Semafor',       null, 1, false, 'info',   15,  0.45, 'light'],
+    'fire hydrant':  ['Hidrant',       0.7,  1, false, 'path',   4,   0.55, 'hydrant'],
+    'parking meter': ['Parcometru',    1.3,  1, false, 'path',   4,   0.55, 'meter'],
+    'bench':         ['Bancă',         0.8,  1, false, 'path',   4,   0.50, 'seat'],
+    'chair':         ['Scaun',         0.9,  1, false, 'path',   4,   0.45, 'seat'],
+    'couch':         ['Canapea',       0.85, 1, false, 'path',   4,   0.50, 'seat'],
+    'dining table':  ['Masă',          0.75, 1, false, 'path',   4,   0.50, 'table'],
+    'potted plant':  ['Ghiveci',       0.6,  1, false, 'path',   4,   0.50, 'plant'],
+    'suitcase':      ['Valiză',        0.6,  1, false, 'path',   3,   0.50, 'bag'],
+    'backpack':      ['Rucsac',        0.5,  1, false, 'path',   3,   0.55, 'bag'],
   };
+  const DET_MIN = 0.3;          // detector threshold; per-class thresholds are applied after
 
-  const btn = document.getElementById('main');
-  const label = document.getElementById('label');
-  const live = document.getElementById('live');
-  const video = document.getElementById('video');
-  const canvas = document.getElementById('overlay');
-  const ctx = canvas.getContext('2d');
+  // ================= Page elements =================
+  const $ = id => document.getElementById(id);
+  const btn = $('main'), label = $('label'), caneLabel = $('cane'), live = $('live');
+  const video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
 
-  let model = null, stream = null, running = false, wakeLock = null;
-  const lastSaid = {};   // class -> timestamp
+  let detector = null, stream = null, running = false, wakeLock = null;
+  const stats = { inferMs: 0, frameTimes: [], spoken: 0, scaleN: 0, pkts: [] };
+  const events = [];            // developer log (numbers and text only, no images)
 
-  function announce(text) {
-    // Clear first so the screen reader repeats identical messages.
+  function logEvent(type, text, extra) {
+    const e = { t: Date.now(), type, text, ...(extra || {}) };
+    events.push(e);
+    if (events.length > 3000) events.shift();
+    if (DEBUG) {
+      const el = $('log');
+      const line = document.createElement('div');
+      const ts = new Date(e.t).toTimeString().slice(0, 8);
+      line.textContent = `${ts} [${type}] ${text}`;
+      line.style.color = type === 'say' ? '#ff6' : type === 'error' ? '#f66' : '#aaa';
+      el.prepend(line);
+      while (el.childNodes.length > 80) el.lastChild.remove();
+    }
+  }
+
+  function announce(text, urgent) {
     live.textContent = '';
     setTimeout(() => { live.textContent = text; }, 50);
-    if (USE_VOICE && 'speechSynthesis' in window) {
-      speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = 'ro-RO';
-      u.rate = 1.1;
-      speechSynthesis.speak(u);
+    if (USE_VOICE && typeof speechSynthesis !== 'undefined') {
+      if (urgent || !speechSynthesis.speaking) {
+        speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = 'ro-RO';
+        u.rate = 1.1;
+        speechSynthesis.speak(u);
+      }
     }
   }
 
   function setLabel(text) {
     label.textContent = text;
     btn.setAttribute('aria-label', text);
+    if (DEBUG) $('bStart').textContent = running ? 'Stop camera' : 'Start camera';
   }
 
   async function keepAwake() {
@@ -87,77 +191,702 @@
     if (running && document.visibilityState === 'visible') keepAwake();
   });
 
-  function describe(det) {
-    const [x, , w, h] = det.bbox;
-    const cx = (x + w / 2) / video.videoWidth;
-    const pos = cx < 1 / 3 ? 'în stânga' : cx > 2 / 3 ? 'în dreapta' : 'în față';
-    const near = h / video.videoHeight > NEAR_RATIO;
-    return { near, text: `${RO[det.class]}${near ? ' aproape' : ''}, ${pos}` };
+  // ================= Phone tilt (for distance from the ground contact point) =================
+  let pitchDown = null;   // camera axis below horizontal, radians (portrait only)
+  function onOrientation(e) {
+    if (e.beta == null) return;
+    const portrait = (window.innerHeight || 1) >= (window.innerWidth || 0);
+    if (!portrait) { pitchDown = null; return; }
+    const p = (90 - e.beta) * Math.PI / 180;    // beta 90 = phone upright = camera horizontal
+    pitchDown = pitchDown == null ? p : pitchDown + 0.15 * (p - pitchDown);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('deviceorientation', onOrientation);
+
+  // ================= Detector =================
+  const MP_VER = '0.10.14';
+  function loadScript(src) {
+    return new Promise((ok, bad) => {
+      const s = document.createElement('script');
+      s.src = src; s.onload = ok; s.onerror = bad;
+      document.head.appendChild(s);
+    });
   }
 
-  function draw(dets) {
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.lineWidth = 4;
-    ctx.font = '24px system-ui';
-    for (const d of dets) {
-      const [x, y, w, h] = d.bbox;
-      ctx.strokeStyle = '#ff0';
-      ctx.strokeRect(x, y, w, h);
-      ctx.fillStyle = '#ff0';
-      ctx.fillText(`${RO[d.class]} ${Math.round(d.score * 100)}%`, x + 4, y + 26);
+  async function loadDetector() {
+    if (MODEL !== 'ssd') {
+      try {
+        const mp = await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`);
+        const files = await mp.FilesetResolver.forVisionTasks(
+          `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`);
+        const name = MODEL === 'lite2' ? 'efficientdet_lite2' : 'efficientdet_lite0';
+        const url = `https://storage.googleapis.com/mediapipe-models/object_detector/${name}/float16/1/${name}.tflite`;
+        for (const delegate of ['GPU', 'CPU']) {
+          try {
+            const d = await mp.ObjectDetector.createFromOptions(files, {
+              baseOptions: { modelAssetPath: url, delegate },
+              runningMode: 'VIDEO', scoreThreshold: DET_MIN, maxResults: 15,
+              // user mode: only THE LIST; debug mode: everything, so you see what is filtered out
+              ...(DEBUG ? {} : { categoryAllowlist: Object.keys(CLASSES) })
+            });
+            let lastTs = 0;
+            return {
+              name: `${name} (${delegate})`, fast: true,
+              detect: () => {
+                const ts = Math.max(performance.now(), lastTs + 1); lastTs = ts;
+                return d.detectForVideo(video, ts).detections.map(x => ({
+                  class: x.categories[0].categoryName, score: x.categories[0].score,
+                  bbox: [x.boundingBox.originX, x.boundingBox.originY, x.boundingBox.width, x.boundingBox.height]
+                }));
+              }
+            };
+          } catch (e) { logEvent('model', `MediaPipe ${delegate} failed: ${e}`); }
+        }
+      } catch (e) { logEvent('model', `MediaPipe not loaded: ${e}`); }
+    }
+    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
+    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js');
+    const m = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    return { name: 'COCO-SSD lite (fallback)', fast: false, detect: () => m.detect(video, 15, DET_MIN) };
+  }
+
+  // ================= Cane over Bluetooth =================
+  let caneDevice = null, caneConnected = false;
+  let caneHist = [];     // [t, ahead-of-body cm or null]       (3 s, for fusion)
+  let dbgHist = [];      // decoded dashboard packets            (12 s, for plots)
+  let caneLog = [];      // [t, cm] 60 s, for export
+
+  async function openCane() {
+    const server = await caneDevice.gatt.connect();
+    const svc = await server.getPrimaryService(SVC_UUID);
+    const ch = await svc.getCharacteristic(DIST_UUID);
+    ch.addEventListener('characteristicvaluechanged', e => {
+      const v = e.target.value.getUint16(0, true);
+      pushCane(Date.now(), v === 0xFFFF ? null : v);
+    });
+    await ch.startNotifications();
+    try {                                           // firmware v4.2+: dashboard stream
+      const dc = await svc.getCharacteristic(DBG_UUID);
+      dc.addEventListener('characteristicvaluechanged', e => pushDbg(Date.now(), e.target.value));
+      await dc.startNotifications();
+      logEvent('cane', 'dashboard stream on');
+    } catch (e) { logEvent('cane', 'no dashboard stream (firmware older than v4.2)'); }
+    caneConnected = true;
+    logEvent('cane', 'connected');
+  }
+
+  function pushCane(t, cm) {
+    caneHist.push([t, cm]);
+    while (caneHist.length && t - caneHist[0][0] > 3000) caneHist.shift();
+    caneLog.push([t, cm]);
+    while (caneLog.length && t - caneLog[0][0] > 60000) caneLog.shift();
+  }
+
+  function decodeDbg(dv) {
+    const u = i => { const v = dv.getUint16(i, true); return v === 0xFFFF ? null : v; };
+    const f = dv.getUint8(10);
+    return { raw: u(0), filt: u(2), cont: u(4), far: u(6), ground: u(8),
+             motor: !!(f & 1), continuous: !!(f & 2), groundMode: !!(f & 4), bench: !!(f & 8),
+             beamDown: dv.getInt8(11), sensorH: dv.getUint8(12) };
+  }
+  function pushDbg(t, dv) {
+    const p = decodeDbg(dv); p.t = t;
+    dbgHist.push(p);
+    while (dbgHist.length && t - dbgHist[0].t > 12000) dbgHist.shift();
+    stats.pkts.push(t);
+  }
+
+  async function connectCane() {
+    if (!navigator.bluetooth) { logEvent('cane', 'Web Bluetooth not available (Android/desktop Chrome only)'); return; }
+    try {
+      if (!caneDevice) {
+        caneDevice = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [SVC_UUID] }, { namePrefix: 'Baston' }],
+          optionalServices: [SVC_UUID]
+        });
+        caneDevice.addEventListener('gattserverdisconnected', onCaneLost);
+      }
+      await openCane();
+    } catch (e) { logEvent('cane', `not connected: ${e}`); }
+  }
+
+  function onCaneLost() {
+    caneConnected = false;
+    caneHist = [];
+    logEvent('cane', 'disconnected');
+    if (running || DEBUG) {
+      if (running) announce('Baston deconectat');
+      setTimeout(retryCane, 2000);
     }
   }
 
+  async function retryCane() {
+    if (caneConnected || !caneDevice) return;
+    try { await openCane(); if (running) announce('Baston conectat'); }
+    catch (e) { setTimeout(retryCane, 3000); }
+  }
+
+  // Closest thing the cane felt during the last sweep, metres ahead of the body (null = nothing).
+  function caneMetres(now) {
+    let best = null;
+    for (const [t, cm] of caneHist)
+      if (now - t <= SWEEP_MS && cm != null && (best == null || cm < best)) best = cm;
+    return best == null ? null : best / 100;
+  }
+
+  // ================= Geometry =================
+  function vfovRad(W, H) {
+    const portraitDeg = VFOV_DEG || 64;
+    if (H >= W) return portraitDeg * Math.PI / 180;
+    // landscape: the long side is horizontal, so vertical FOV is the "short" one
+    const tanLong = Math.tan(portraitDeg * Math.PI / 360);
+    return 2 * Math.atan(tanLong * H / W);
+  }
+  function hfovRad(W, H) { return 2 * Math.atan(Math.tan(vfovRad(W, H) / 2) * W / H); }
+  function bearingDeg(px, W, H) {
+    return Math.atan((px / W - 0.5) * 2 * Math.tan(hfovRad(W, H) / 2)) * 180 / Math.PI;
+  }
+
+  // ================= Tracking =================
+  let tracks = [], nextId = 1;
+  const classMemory = {};
+  const groupOf = c => CLASSES[c][7];
+
+  function iou(a, b) {
+    const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]);
+    const x2 = Math.min(a[0] + a[2], b[0] + b[2]), y2 = Math.min(a[1] + a[3], b[1] + b[3]);
+    const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+    return inter / (a[2] * a[3] + b[2] * b[3] - inter);
+  }
+
+  // Overlap first; if the box jumped (low frame rate, fast motion) accept a nearby box of similar size.
+  function matchScore(a, b) {
+    const i = iou(a, b);
+    if (i > 0.2) return i;
+    const dx = (a[0] + a[2] / 2) - (b[0] + b[2] / 2), dy = (a[1] + a[3] / 2) - (b[1] + b[3] / 2);
+    const diag = Math.hypot((a[2] + b[2]) / 2, (a[3] + b[3]) / 2);
+    const c = 1 - Math.hypot(dx, dy) / (0.6 * diag);
+    const sizeOk = Math.min(a[3], b[3]) / Math.max(a[3], b[3]) > 0.6;
+    return c > 0 && sizeOk ? 0.2 * c : 0;
+  }
+
+  function measure(t, W, H, now) {
+    const [x, y, w, h] = t.box;
+    const realH = CLASSES[t.cls][1];
+    const tanV = Math.tan(vfovRad(W, H) / 2);
+    const topCut = y < 0.02 * H, botCut = y + h > 0.97 * H;
+    let dH = null, dG = null;
+    if (realH) {
+      dH = realH / (Math.min(h / H, 1) * 2 * tanV);                 // from apparent height
+      if (pitchDown != null && !botCut) {                           // from where it stands on the floor
+        const below = Math.atan(((y + h) / H - 0.5) * 2 * tanV);
+        const a = pitchDown + below;
+        if (a > 0.03) dG = CAM_H_M / Math.tan(a);
+      }
+    }
+    let d = null, src = '';
+    if (dH != null && dG != null) {
+      const wH = topCut ? 0.3 : 1, wG = 1.5;                        // geometric weighted mean
+      d = Math.exp((wH * Math.log(dH) + wG * Math.log(dG)) / (wH + wG)); src = 'h+g';
+    } else if (dG != null) { d = dG; src = 'g'; }
+    else if (dH != null) { d = dH; src = (topCut || botCut) ? 'h*' : 'h'; }
+    if (d != null && dG == null && h / H > 0.9) d = Math.min(d, 1.0); // fills the frame: close
+    t.dH = dH; t.dG = dG; t.src = src;
+    t.rawDist = d == null ? null : (t.rawDist == null ? d : t.rawDist + 0.4 * (d - t.rawDist));
+    t.camDist = t.rawDist == null ? null : t.rawDist * camScale;
+
+    t.bearing = bearingDeg(x + w / 2, W, H);
+    t.bearL = bearingDeg(x, W, H);
+    t.bearR = bearingDeg(x + w, W, H);
+    placeInPath(t, t.camDist);
+
+    t.hist.push([now, t.camDist]);
+    while (t.hist.length && now - t.hist[0][0] > 2000) t.hist.shift();
+    t.approaching = false;
+    if (CLASSES[t.cls][3] && t.camDist != null && t.hist.length > 3) {
+      const old = t.hist[0];
+      if (now - old[0] > 1000 && old[1] != null && t.camDist < 0.75 * old[1]) t.approaching = true;
+    }
+    if (t.lateral != null) { t.trail.push([t.lateral, t.camDist]); if (t.trail.length > 25) t.trail.shift(); }
+  }
+
+  function placeInPath(t, d) {
+    const rad = Math.PI / 180;
+    if (d != null) {
+      const latL = d * Math.tan((t.bearL - YAW_TOL_DEG) * rad) + CAM_OFFSET_M;
+      const latR = d * Math.tan((t.bearR + YAW_TOL_DEG) * rad) + CAM_OFFSET_M;
+      t.lateral = d * Math.tan(t.bearing * rad) + CAM_OFFSET_M;
+      t.inPath = latR > -CORRIDOR_HALF_M && latL < CORRIDOR_HALF_M;
+    } else {
+      t.lateral = null;
+      t.inPath = Math.abs(t.bearing) < AHEAD_DEG || (t.bearL < 0 && t.bearR > 0);
+    }
+    t.side = t.inPath ? 'în față'
+           : (t.lateral != null ? t.lateral : t.bearing) < 0 ? 'în stânga' : 'în dreapta';
+  }
+
+  function vote(t, cls, score) {
+    for (const k in t.votes) t.votes[k] *= 0.85;
+    t.votes[cls] = (t.votes[cls] || 0) + score;
+    let best = t.cls;
+    for (const k in t.votes) if (t.votes[k] > (t.votes[best] || 0) * 1.2) best = k;   // 20 % margin
+    t.cls = best;
+  }
+
+  function updateTracks(dets, W, H, now) {
+    const pairs = [];
+    dets.forEach((d, i) => tracks.forEach((t, j) => {
+      if (groupOf(t.cls) === groupOf(d.class)) {
+        const v = matchScore(t.box, d.bbox);
+        if (v > 0.05) pairs.push([v, i, j]);
+      }
+    }));
+    pairs.sort((a, b) => b[0] - a[0]);
+    const usedD = new Set(), usedT = new Set();
+    for (const [, i, j] of pairs) {
+      if (usedD.has(i) || usedT.has(j)) continue;
+      usedD.add(i); usedT.add(j);
+      const t = tracks[j], b = dets[i].bbox;
+      t.box = t.box.map((v, k) => v + 0.5 * (b[k] - v));
+      t.hits++; t.misses = 0; t.score = dets[i].score;
+      vote(t, dets[i].class, dets[i].score);
+      measure(t, W, H, now);
+    }
+    tracks.forEach((t, j) => { if (!usedT.has(j)) t.misses++; });
+    tracks = tracks.filter(t => t.misses <= MAX_MISSES);
+    dets.forEach((d, i) => {
+      if (usedD.has(i)) return;
+      const t = { id: nextId++, cls: d.class, votes: { [d.class]: d.score }, box: d.bbox.slice(),
+                  hits: 1, misses: 0, score: d.score, rawDist: null, camDist: null, hist: [],
+                  trail: [], said: null, why: '', fuseN: 0 };
+      measure(t, W, H, now);
+      tracks.push(t);
+    });
+  }
+
+  // ================= Fusion: cane + camera =================
+  function fuseCane(now) {
+    const us = caneMetres(now);
+    let best = null, bestErr = Math.log(FUSE_MAX_RATIO);
+    for (const t of tracks) {
+      t.dist = t.camDist; t.fused = false;
+      if (us == null || !t.inPath || t.camDist == null || t.misses > 0) continue;
+      const err = Math.abs(Math.log(us / t.camDist));
+      if (err < bestErr) { bestErr = err; best = t; }
+    }
+    for (const t of tracks) if (t !== best) t.fuseN = 0;
+    if (best) {
+      best.dist = us; best.fused = true; best.fuseN++;
+      placeInPath(best, us);
+      // The cane is the ruler: after 3 agreeing frames, nudge the camera's distance scale.
+      if (best.fuseN >= 3 && best.rawDist) {
+        const r = Math.min(2, Math.max(0.5, us / best.rawDist));
+        camScale = Math.min(1.6, Math.max(0.6, camScale + 0.03 * (r - camScale)));
+        stats.scaleN++;
+      }
+    }
+  }
+
+  // ================= What to say =================
+  function bucket(d) { if (d == null) return 0; if (d < NEAR_M) return 1; return Math.round(d); }
+
+  function distWords(t) {
+    const d = t.dist;
+    if (d == null) return '';
+    if (t.fused) {
+      if (d < 0.8) return 'foarte aproape';
+      if (d < NEAR_M) return 'la un metru';
+    } else if (d < NEAR_M) return 'aproape';
+    return `la ${Math.round(d)} metri`;
+  }
+
+  function sentence(t) {
+    const name = CLASSES[t.cls][0], dw = distWords(t);
+    if (t.approaching && !(t.dist != null && t.dist < NEAR_M))
+      return dw ? `${name} se apropie, ${dw}, ${t.side}` : `${name} se apropie, ${t.side}`;
+    return dw ? `${name}, ${dw}, ${t.side}` : `${name} ${t.side}`;
+  }
+
+  function relevance(t) {
+    let s = CLASSES[t.cls][2];
+    if (t.inPath) s += 2;
+    if (t.dist != null) s += t.dist < NEAR_M ? 3 : t.dist < 3 ? 1 : 0;
+    if (t.approaching) s += 2;
+    if (t.fused) s += 1;
+    return s;
+  }
+
+  function cares(t) {
+    const rule = CLASSES[t.cls][4], maxM = CLASSES[t.cls][5];
+    const d = t.dist, near = d != null && d < NEAR_M;
+    const inRange = d == null || d <= maxM;
+    if (rule === 'path')   return (t.inPath && inRange) || near;
+    if (rule === 'moving') return (t.inPath && inRange) || near ||
+                                  (t.approaching && d != null && d <= APPROACH_MAX_M);
+    if (rule === 'info')   return inRange;
+    return false;
+  }
+
+  function isUrgent(t) { return t.inPath && t.dist != null && t.dist < NEAR_M; }
+
+  // Decides if this object is spoken now; t.why records the reason (dashboard).
+  function wantsToSpeak(t, now) {
+    const no = why => { t.why = why; return false; };
+    const yes = why => { t.why = why; return true; };
+    if (t.hits < CONFIRM_HITS) return no('not confirmed yet');
+    if (t.misses > 0) return no('lost this frame');
+    if (!cares(t)) return no(t.inPath ? 'too far for THE LIST' : 'not in my way');
+    const pr = CLASSES[t.cls][2], b = bucket(t.dist);
+    if (!t.said) {
+      const m = classMemory[t.cls], info = CLASSES[t.cls][4] === 'info';
+      if (m && now - m.t < (info ? INFO_MEMORY_MS : CLASS_MEMORY_MS) && (m.side === t.side || info) &&
+          !(b && m.bucket && b < m.bucket)) {
+        t.said = { t: m.t, bucket: m.bucket, inPath: t.inPath, approaching: false };
+        return no('same as recently said (flicker)');
+      }
+      return yes('new');
+    }
+    const since = now - t.said.t;
+    if (b === 1 && t.said.bucket !== 1 && (t.inPath || pr > 1)) return yes('became near');
+    if (since < SAME_TRACK_MS) return no('said < 2.5 s ago');
+    if (t.approaching && !t.said.approaching) return yes('started approaching');
+    if (b && t.said.bucket && b <= t.said.bucket - 2) return yes('2+ m closer');
+    if (t.inPath && !t.said.inPath && (pr > 1 || b === 1)) return yes('moved into my path');
+    if (isUrgent(t) && since > NEAR_REPEAT_MS) return yes('still right in front');
+    return no('already said, nothing changed');
+  }
+
+  let lastSpoken = -1e9;
+  let unknown = { nearSince: 0, lastNear: 0, armed: true };
+
+  function speakNext(now) {
+    const candidates = tracks.filter(t => wantsToSpeak(t, now)).sort((a, b) => relevance(b) - relevance(a));
+    const top = candidates[0];
+    const us = caneMetres(now);
+    let unknownText = null;
+    if (us != null && us < UNKNOWN_M) {
+      if (!unknown.nearSince) unknown.nearSince = now;
+      unknown.lastNear = now;
+      const named = tracks.some(t => t.fused || (t.inPath && t.hits >= CONFIRM_HITS && t.dist != null && t.dist < 2.5));
+      if (unknown.armed && !named && now - unknown.nearSince > UNKNOWN_HOLD_MS)
+        unknownText = us < 0.8 ? 'Obstacol foarte aproape' : 'Obstacol, la un metru';
+    } else {
+      unknown.nearSince = 0;
+      if (now - unknown.lastNear > UNKNOWN_REARM_MS) unknown.armed = true;
+    }
+    const urgent = (top && isUrgent(top)) || !!unknownText;
+    if (!urgent && now - lastSpoken < GAP_MS) return;
+    if (top && (!unknownText || isUrgent(top))) {
+      const text = sentence(top);
+      announce(text, isUrgent(top));
+      logEvent('say', `${text}   (#${top.id} ${top.why}, ${top.fused ? 'cane' : top.src} ${top.dist != null ? top.dist.toFixed(2) + ' m' : ''}, ${top.bearing.toFixed(0)}°)`);
+      top.said = { t: now, bucket: bucket(top.dist), inPath: top.inPath, approaching: top.approaching };
+      classMemory[top.cls] = { t: now, bucket: bucket(top.dist), side: top.side };
+      lastSpoken = now; stats.spoken++;
+    } else if (unknownText) {
+      announce(unknownText, true);
+      logEvent('say', `${unknownText}   (cane ${us.toFixed(2)} m, camera sees nothing in the path)`);
+      unknown.armed = false; lastSpoken = now; stats.spoken++;
+    }
+  }
+
+  // ================= Camera overlay =================
+  let lastRawDets = [];
+  function colourOf(t) { return !cares(t) ? '#888' : isUrgent(t) ? '#f33' : t.fused ? '#3f6' : '#ff0'; }
+
+  function drawOverlay(W, H, now) {
+    canvas.width = W; canvas.height = H;
+    ctx.clearRect(0, 0, W, H);
+    ctx.lineWidth = 4; ctx.font = '22px system-ui';
+    ctx.strokeStyle = 'rgba(255,255,255,.35)';
+    ctx.beginPath(); ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, H); ctx.stroke();
+    if (DEBUG) {                         // everything the model returned, before our filters
+      ctx.setLineDash([6, 6]); ctx.lineWidth = 2; ctx.strokeStyle = '#777'; ctx.fillStyle = '#777';
+      ctx.font = '16px system-ui';
+      for (const d of lastRawDets) {
+        ctx.strokeRect(...d.bbox);
+        ctx.fillText(`${d.class} ${(d.score * 100).toFixed(0)}%`, d.bbox[0] + 3, d.bbox[1] + d.bbox[3] - 4);
+      }
+      ctx.setLineDash([]); ctx.lineWidth = 4; ctx.font = '22px system-ui';
+    }
+    for (const t of tracks) {
+      if (t.hits < CONFIRM_HITS) continue;
+      const [x, y, w, h] = t.box, col = colourOf(t);
+      ctx.strokeStyle = col; ctx.fillStyle = col;
+      ctx.strokeRect(x, y, w, h);
+      const d = t.dist == null ? '' : ` ${t.dist.toFixed(1)} m${t.fused ? ' (baston)' : ''}`;
+      ctx.fillText(`${DEBUG ? '#' + t.id + ' ' : ''}${CLASSES[t.cls][0]}${d}`, x + 4, y + 24);
+      const lat = t.lateral == null ? '' : `, ${t.lateral >= 0 ? '+' : ''}${t.lateral.toFixed(1)} m`;
+      ctx.fillText(`${Math.round(t.bearing)}°${lat} ${t.inPath ? 'ÎN CALE' : ''}`, x + 4, y + 50);
+    }
+    if (USE_CANE && !DEBUG) {
+      const us = caneMetres(now);
+      caneLabel.textContent = !caneConnected ? 'Baston: neconectat'
+        : us == null ? 'Baston: liber' : `Baston: ${Math.round(us * 100)} cm`;
+    }
+  }
+
+  // ================= Developer dashboard =================
+  function prepCanvas(c) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.height / (c._dpr || 1);
+    c._dpr = dpr;
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+    const g = c.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    g.font = '11px ui-monospace, monospace';
+    return [g, w, h];
+  }
+
+  function drawRadar(now) {
+    const [g, w, h] = prepCanvas($('radar'));
+    const R = 6, sc = Math.min(w / 6.4, (h - 16) / R);
+    const X = lat => w / 2 + lat * sc, Y = d => h - 8 - d * sc;
+    g.strokeStyle = '#333'; g.fillStyle = '#666';
+    for (let r = 1; r <= R; r++) {
+      g.beginPath(); g.arc(X(0), Y(0), r * sc, Math.PI, 2 * Math.PI); g.stroke();
+      g.fillText(`${r} m`, X(0) + 3, Y(r) + 11);
+    }
+    // camera field of view
+    const W = video.videoWidth || 480, H = video.videoHeight || 640, half = hfovRad(W, H) / 2;
+    g.strokeStyle = '#468'; g.beginPath();
+    for (const s of [-1, 1]) { g.moveTo(X(CAM_OFFSET_M), Y(0)); g.lineTo(X(CAM_OFFSET_M + s * R * Math.tan(half)), Y(R)); }
+    g.stroke();
+    // walking corridor
+    g.setLineDash([4, 4]); g.strokeStyle = '#5a5';
+    g.beginPath(); for (const s of [-1, 1]) { g.moveTo(X(s * CORRIDOR_HALF_M), Y(0)); g.lineTo(X(s * CORRIDOR_HALF_M), Y(R)); } g.stroke();
+    g.setLineDash([]);
+    // cane zones and echo
+    const p = dbgHist[dbgHist.length - 1];
+    const ahead = cm => cm == null ? null : (cm * Math.cos((p ? p.beamDown : 5) * Math.PI / 180)) / 100 + CANE_BODY_M;
+    const cw = CORRIDOR_HALF_M;
+    if (p && now - p.t < 1000) {
+      const c = ahead(p.cont), f = ahead(p.far);
+      g.fillStyle = 'rgba(255,60,60,.12)'; g.fillRect(X(-cw), Y(c), 2 * cw * sc, (c - CANE_BODY_M) * sc);
+      g.fillStyle = 'rgba(255,160,0,.10)'; g.fillRect(X(-cw), Y(f), 2 * cw * sc, (f - c) * sc);
+    }
+    const us = caneMetres(now);
+    if (us != null) {
+      g.strokeStyle = p && p.continuous ? '#f33' : '#fa0'; g.lineWidth = 3;
+      g.beginPath(); g.moveTo(X(-cw), Y(us)); g.lineTo(X(cw), Y(us)); g.stroke(); g.lineWidth = 1;
+      g.fillStyle = g.strokeStyle; g.fillText(`cane ${us.toFixed(2)} m`, X(cw) + 4, Y(us) + 4);
+    }
+    // tracks
+    for (const t of tracks) {
+      if (t.hits < CONFIRM_HITS) continue;
+      const col = colourOf(t);
+      g.strokeStyle = col; g.fillStyle = col;
+      if (t.dist == null) {                      // no distance: a ray at its bearing
+        g.setLineDash([3, 5]); g.beginPath(); g.moveTo(X(CAM_OFFSET_M), Y(0));
+        g.lineTo(X(CAM_OFFSET_M + R * Math.tan(t.bearing * Math.PI / 180)), Y(R)); g.stroke(); g.setLineDash([]);
+        continue;
+      }
+      g.globalAlpha = 0.4; g.beginPath();
+      t.trail.forEach(([lx, d], i) => i ? g.lineTo(X(lx), Y(d)) : g.moveTo(X(lx), Y(d))); g.stroke();
+      g.globalAlpha = 1;
+      const rad = Math.PI / 180, d = t.dist;
+      const l = d * Math.tan(t.bearL * rad) + CAM_OFFSET_M, r = d * Math.tan(t.bearR * rad) + CAM_OFFSET_M;
+      g.fillRect(X(l), Y(d) - 3, Math.max(3, (r - l) * sc), 6);
+      g.fillText(`#${t.id} ${t.cls} ${d.toFixed(1)}`, X(r) + 4, Y(d) + 4);
+    }
+    g.fillStyle = '#fff'; g.beginPath(); g.arc(X(0), Y(0), 5, 0, 2 * Math.PI); g.fill();
+  }
+
+  function drawCanePlot(now) {
+    const [g, w, h] = prepCanvas($('caneplot'));
+    const T = 10000, MAXCM = 250;
+    const X = t => w - (now - t) / T * w, Y = cm => h - 4 - Math.min(cm, MAXCM) / MAXCM * (h - 8);
+    g.strokeStyle = '#333'; g.fillStyle = '#666';
+    for (let cm = 50; cm <= 250; cm += 50) { g.beginPath(); g.moveTo(0, Y(cm)); g.lineTo(w, Y(cm)); g.stroke(); g.fillText(cm, 2, Y(cm) - 2); }
+    if (!dbgHist.length) {
+      g.fillStyle = '#aaa';
+      g.fillText(caneConnected ? 'connected, no dashboard stream: flash cane_core v4.2' : 'cane not connected', 10, 20);
+      // fall back to the plain distance channel
+      g.strokeStyle = '#0cf'; g.beginPath(); let on = false;
+      for (const [t, cm] of caneHist) { if (cm == null) { on = false; continue; } on ? g.lineTo(X(t), Y(cm)) : g.moveTo(X(t), Y(cm)); on = true; }
+      g.stroke();
+      return;
+    }
+    // motor on = red band at the bottom
+    g.fillStyle = 'rgba(255,50,50,.7)';
+    for (let i = 1; i < dbgHist.length; i++) if (dbgHist[i].motor) g.fillRect(X(dbgHist[i - 1].t), h - 8, X(dbgHist[i].t) - X(dbgHist[i - 1].t) + 1, 8);
+    const line = (key, col, dash) => {
+      g.strokeStyle = col; g.setLineDash(dash || []); g.beginPath(); let on = false;
+      for (const p of dbgHist) { const v = p[key]; if (v == null) { on = false; continue; } on ? g.lineTo(X(p.t), Y(v)) : g.moveTo(X(p.t), Y(v)); on = true; }
+      g.stroke(); g.setLineDash([]);
+    };
+    line('cont', '#f44', [4, 3]); line('far', '#fa0', [4, 3]); line('ground', '#a76', [2, 4]);
+    g.fillStyle = '#999';
+    for (const p of dbgHist) if (p.raw != null) g.fillRect(X(p.t) - 1, Y(p.raw) - 1, 3, 3);
+    g.lineWidth = 2; line('filt', '#0cf'); g.lineWidth = 1;
+    const p = dbgHist[dbgHist.length - 1];
+    g.fillStyle = '#ddd';
+    g.fillText(`raw ${p.raw ?? '—'}  filt ${p.filt ?? '—'}  cont<${p.cont}  far<${p.far}  ${p.groundMode ? 'floor ' + p.ground : 'no floor'}  ${p.bench ? 'BENCH' : ''}`, 30, 12);
+    g.fillText('grey = raw ping, blue = filtered, red/orange dashed = continuous/pulse limits, red bar = motor', 30, 25);
+  }
+
+  function drawSide(now) {
+    const [g, w, h] = prepCanvas($('side'));
+    const p = dbgHist[dbgHist.length - 1];
+    if (!p) { g.fillStyle = '#aaa'; g.fillText('needs firmware v4.2 + cane connected', 10, 20); return; }
+    const MAXX = 260, MAXY = 130, sc = Math.min((w - 20) / MAXX, (h - 20) / MAXY);
+    const X = cm => 10 + cm * sc, Y = cm => h - 10 - cm * sc;
+    const sh = p.sensorH, bd = p.beamDown * Math.PI / 180, half = 15 * Math.PI / 180;
+    g.strokeStyle = '#555'; g.beginPath(); g.moveTo(0, Y(0)); g.lineTo(w, Y(0)); g.stroke();      // floor
+    const tipX = Math.max(0, (p.cont - 10) * Math.cos(bd));
+    g.strokeStyle = '#ddd'; g.lineWidth = 3; g.beginPath(); g.moveTo(X(0), Y(sh)); g.lineTo(X(tipX), Y(0)); g.stroke(); g.lineWidth = 1;
+    // beam wedge, clipped by the floor
+    const ray = (a, r) => { let x = r * Math.cos(a), y = sh - r * Math.sin(a); if (y < 0) { const k = sh / (sh - y); x *= k; y = 0; } return [x, y]; };
+    g.fillStyle = 'rgba(80,160,255,.15)'; g.beginPath(); g.moveTo(X(0), Y(sh));
+    for (let a = bd - half; a <= bd + half + 1e-6; a += half / 8) { const [x, y] = ray(a, p.far); g.lineTo(X(x), Y(y)); }
+    g.closePath(); g.fill();
+    // zones along the beam axis
+    const axis = r => ray(bd, r);
+    const [cx, cy] = axis(p.cont); g.fillStyle = '#f44'; g.fillRect(X(cx) - 1, Y(cy) - 6, 2, 12); g.fillText('cont', X(cx) - 10, Y(cy) - 8);
+    const [fx, fy] = axis(p.far); g.fillStyle = '#fa0'; g.fillRect(X(fx) - 1, Y(fy) - 6, 2, 12); g.fillText('far', X(fx) - 8, Y(fy) - 8);
+    if (p.raw != null) { const [x, y] = axis(p.raw); g.fillStyle = '#999'; g.beginPath(); g.arc(X(x), Y(y), 3, 0, 7); g.fill(); }
+    if (p.filt != null) {
+      g.strokeStyle = p.continuous ? '#f33' : '#fa0'; g.lineWidth = 3; g.beginPath();
+      g.arc(X(0), Y(sh), p.filt * sc, bd - half, bd + half); g.stroke(); g.lineWidth = 1;
+    }
+    g.fillStyle = '#ddd';
+    g.fillText(`sensor ${sh} cm high, beam ${p.beamDown}° down, echo ${p.filt ?? '—'} cm, motor ${p.motor ? (p.continuous ? 'CONTINUOUS' : 'pulse') : 'off'}`, 10, 12);
+  }
+
+  let lastTableDraw = 0;
+  function drawStats(now) {
+    const fps = stats.frameTimes.length > 1 ? 1000 * (stats.frameTimes.length - 1) / (stats.frameTimes[stats.frameTimes.length - 1] - stats.frameTimes[0]) : 0;
+    stats.pkts = stats.pkts.filter(t => now - t < 2000);
+    const W = video.videoWidth, H = video.videoHeight;
+    const conf = tracks.filter(t => t.hits >= CONFIRM_HITS);
+    $('stats').textContent = [
+      `model     ${detector ? detector.name : '—'}   ${running ? 'RUNNING' : 'stopped'}`,
+      `speed     ${stats.inferMs.toFixed(0)} ms/frame, ${fps.toFixed(1)} fps`,
+      `video     ${W || '—'}x${H || '—'}  vfov ${W ? (vfovRad(W, H) * 180 / Math.PI).toFixed(0) : '—'}°  hfov ${W ? (hfovRad(W, H) * 180 / Math.PI).toFixed(0) : '—'}°`,
+      `tilt      ${pitchDown == null ? 'no sensor / landscape (height-only distance)' : (pitchDown * 180 / Math.PI).toFixed(1) + '° down'}  cam height ${CAM_H_M.toFixed(2)} m`,
+      `scale     camera distance x${camScale.toFixed(2)}  (${stats.scaleN} cane corrections)`,
+      `tracks    ${tracks.length} total, ${conf.length} confirmed, ${conf.filter(cares).length} on THE LIST`,
+      `cane      ${caneConnected ? 'connected' : 'not connected'}, ${(stats.pkts.length / 2).toFixed(0)} pkt/s, sweep min ${caneMetres(now)?.toFixed(2) ?? '—'} m`,
+      `spoken    ${stats.spoken}   voice ${USE_VOICE ? 'on' : 'off'}`
+    ].join('\n');
+    if (now - lastTableDraw < 250) return;
+    lastTableDraw = now;
+    const f = v => v == null ? '—' : v.toFixed(2);
+    const rows = conf.concat(tracks.filter(t => t.hits < CONFIRM_HITS)).map(t => {
+      const votes = Object.entries(t.votes).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([k, v]) => `${k}:${v.toFixed(1)}`).join(' ');
+      return `<tr style="color:${t.hits >= CONFIRM_HITS ? colourOf(t) : '#666'}"><td>#${t.id}</td><td>${t.cls}</td><td>${votes}</td>
+        <td>${(t.score * 100).toFixed(0)}%</td><td>${t.hits}/${t.misses}</td><td>${f(t.dH)}</td><td>${f(t.dG)}</td>
+        <td>${f(t.dist)} ${t.fused ? 'cane' : t.src}</td><td>${t.bearing.toFixed(0)}°</td><td>${f(t.lateral)}</td>
+        <td>${t.inPath ? 'yes' : ''}</td><td>${cares(t) ? 'yes' : ''}</td><td>${t.approaching ? 'yes' : ''}</td><td>${t.why}</td></tr>`;
+    });
+    $('tracks').innerHTML = '<tr><th>id</th><th>class</th><th>votes</th><th>score</th><th>hit/miss</th><th>d height</th><th>d ground</th><th>dist</th><th>bearing</th><th>side m</th><th>in path</th><th>LIST</th><th>appr.</th><th>decision</th></tr>' + rows.join('');
+  }
+
+  function dashLoop() {
+    const now = Date.now();
+    try { drawRadar(now); drawCanePlot(now); drawSide(now); drawStats(now); } catch (e) { console.error(e); }
+    requestAnimationFrame(dashLoop);
+  }
+
+  function buildControls() {
+    const defs = [
+      ['fov', 'vertical FOV°', 0, 90, 1, () => VFOV_DEG, v => VFOV_DEG = v],
+      ['lat', 'path half-width', 0.2, 1.2, 0.05, () => CORRIDOR_HALF_M, v => CORRIDOR_HALF_M = v],
+      ['off', 'camera offset', -0.4, 0.4, 0.01, () => CAM_OFFSET_M, v => CAM_OFFSET_M = v],
+      ['h', 'camera height', 0.5, 1.6, 0.01, () => CAM_H_M, v => CAM_H_M = v],
+      ['bias', 'score bias', -0.2, 0.3, 0.01, () => SCORE_BIAS, v => SCORE_BIAS = v],
+      ['scale', 'distance scale', 0.6, 1.6, 0.01, () => camScale, v => camScale = v],
+    ];
+    const box = $('controls');
+    for (const [key, name, mn, mx, st, get, set] of defs) {
+      const row = document.createElement('label'); row.className = 'ctl';
+      row.innerHTML = `<span>${name}</span><input type="range" min="${mn}" max="${mx}" step="${st}"><span></span>`;
+      const inp = row.querySelector('input'), out = row.querySelector('span:last-child');
+      inp.value = get(); out.textContent = key === 'fov' && !get() ? 'auto' : (+get()).toFixed(2);
+      inp.addEventListener('input', () => { set(+inp.value); out.textContent = key === 'fov' && !+inp.value ? 'auto' : (+inp.value).toFixed(2); updateUrl(); });
+      row.dataset.key = key; box.appendChild(row);
+    }
+    function updateUrl() {
+      const p = new URLSearchParams();
+      if (VFOV_DEG) p.set('fov', VFOV_DEG);
+      p.set('lat', CORRIDOR_HALF_M); p.set('off', CAM_OFFSET_M); p.set('h', CAM_H_M);
+      if (SCORE_BIAS) p.set('bias', SCORE_BIAS);
+      p.set('scale', camScale.toFixed(2)); if (MODEL !== 'lite0') p.set('model', MODEL);
+      $('urlOut').textContent = 'User-mode URL with these settings: ' + location.origin + location.pathname + '?' + p.toString() + '&baston=1';
+    }
+    updateUrl();
+    setInterval(() => {   // keep the scale slider in step with what the cane taught
+      const r = box.querySelector('[data-key="scale"]');
+      if (r && document.activeElement !== r.querySelector('input')) { r.querySelector('input').value = camScale; r.querySelector('span:last-child').textContent = camScale.toFixed(2); }
+    }, 1000);
+  }
+
+  function exportLog() {
+    const data = {
+      exported: new Date().toISOString(), model: detector && detector.name,
+      settings: { VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS, camScale },
+      events, caneAheadCm: caneLog, caneDashboard: dbgHist,
+      tracks: tracks.map(t => ({ id: t.id, cls: t.cls, votes: t.votes, dist: t.dist, src: t.fused ? 'cane' : t.src,
+                                 bearing: t.bearing, lateral: t.lateral, inPath: t.inPath, why: t.why }))
+    };
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' }));
+    a.download = `baston-log-${Date.now()}.json`;
+    a.click();
+  }
+
+  // ================= Main loop =================
   async function loop() {
     if (!running) return;
     try {
-      const all = await model.detect(video, 10, MIN_SCORE);
-      const dets = all.filter(d => RO[d.class]);
-      draw(dets);
-
-      // Pick ONE thing to say: near objects first, then the biggest box.
-      const now = Date.now();
-      const candidates = dets
-        .filter(d => !lastSaid[d.class] || now - lastSaid[d.class] > COOLDOWN_MS)
-        .map(d => ({ d, ...describe(d), area: d.bbox[2] * d.bbox[3] }))
-        .sort((a, b) => (b.near - a.near) || (b.area - a.area));
-      if (candidates.length) {
-        lastSaid[candidates[0].d.class] = now;
-        announce(candidates[0].text);
+      const W = video.videoWidth, H = video.videoHeight;
+      if (W && H) {
+        const t0 = performance.now();
+        const raw = await detector.detect();
+        stats.inferMs += 0.2 * ((performance.now() - t0) - stats.inferMs);
+        const now = Date.now();
+        stats.frameTimes.push(now); if (stats.frameTimes.length > 20) stats.frameTimes.shift();
+        lastRawDets = raw;
+        const dets = raw.filter(d => CLASSES[d.class] && d.score >= CLASSES[d.class][6] + SCORE_BIAS);
+        updateTracks(dets, W, H, now);
+        fuseCane(now);
+        drawOverlay(W, H, now);
+        speakNext(now);
       }
-    } catch (e) {
-      console.error(e);
-    }
-    setTimeout(loop, LOOP_MS);
+    } catch (e) { console.error(e); logEvent('error', String(e)); }
+    setTimeout(loop, detector.fast ? LOOP_MS_FAST : LOOP_MS_SLOW);
   }
 
   async function start() {
+    if (USE_CANE && !DEBUG) await connectCane();      // Bluetooth picker needs the tap: first
+    if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) {
+      try { await DeviceOrientationEvent.requestPermission(); } catch (e) {}   // iPhone only
+    }
     setLabel('Se pornește camera…');
     announce('Se pornește camera');
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
-        audio: false
-      });
+        video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
     } catch (e) {
       setLabel('Camera nu a putut fi pornită. Atinge pentru a încerca din nou.');
       announce('Camera nu a putut fi pornită');
+      logEvent('error', `camera: ${e}`);
       return;
     }
     video.srcObject = stream;
     await video.play();
-
-    if (!model) {
+    if (!detector) {
       setLabel('Se încarcă modelul…');
       announce('Se încarcă modelul');
-      model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+      detector = await loadDetector();
+      logEvent('model', `using ${detector.name}`);
     }
+    tracks = [];
     running = true;
     keepAwake();
+    const caneTxt = !USE_CANE ? '' : caneConnected ? ', baston conectat' : ', fără baston';
     setLabel('Detectare pornită. Atinge pentru a opri.');
-    announce('Detectare pornită');
+    announce(`Detectare pornită${caneTxt}`);
     loop();
   }
 
@@ -166,20 +895,35 @@
     if (stream) stream.getTracks().forEach(t => t.stop());
     stream = null;
     if (wakeLock) { wakeLock.release(); wakeLock = null; }
+    if (!DEBUG && caneDevice && caneDevice.gatt.connected) caneDevice.gatt.disconnect();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+    caneLabel.textContent = '';
     setLabel('Detectare oprită. Atinge pentru a porni.');
     announce('Detectare oprită');
   }
 
   let busy = false;
-  btn.addEventListener('click', async () => {
+  async function toggle() {
     if (busy) return;
     busy = true;
     try { running ? stop() : await start(); } finally { busy = false; }
-  });
+  }
+  btn.addEventListener('click', toggle);
 
+  if (DEBUG) {
+    document.body.classList.add('debug');
+    $('view').append(video, canvas);
+    $('bStart').addEventListener('click', toggle);
+    $('bCane').addEventListener('click', connectCane);
+    const bv = $('bVoice');
+    bv.textContent = `Voice: ${USE_VOICE ? 'on' : 'off'}`;
+    bv.addEventListener('click', () => { USE_VOICE = !USE_VOICE; bv.textContent = `Voice: ${USE_VOICE ? 'on' : 'off'}`; });
+    $('bExport').addEventListener('click', exportLog);
+    buildControls();
+    requestAnimationFrame(dashLoop);
+    logEvent('info', 'debug mode. Start camera, connect cane (Android/desktop Chrome), walk.');
+  }
   setLabel('Pornește detectarea');
-  // Frames are only read from the live video in memory; nothing is stored or sent.
   </script>
 </body>
 </html>
