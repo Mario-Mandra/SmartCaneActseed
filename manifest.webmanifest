@@ -1,0 +1,9 @@
+{
+  "name": "Baston – detectare obiecte",
+  "short_name": "Baston",
+  "lang": "ro",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000"
+}
