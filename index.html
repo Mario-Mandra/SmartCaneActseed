@@ -84,14 +84,18 @@
   // Cane over Bluetooth (?baston=1): its measured distance names the object in front, corrects the
   // camera's distance scale over time, and gives "Obstacol" when the camera can't name what the cane feels.
   // ?debug=1 = developer dashboard. Frames are processed in memory only, never stored or sent.
+  // v4.2: ?share=CODE on the phone streams detections + cane data (no images) to any number of
+  // screens opened with ?view=CODE (laptop, tablet), via WebRTC (PeerJS).
 
   // ================= Settings =================
   const params = new URLSearchParams(location.search);
   const num = (k, d) => (params.has(k) && params.get(k) !== '' && !isNaN(+params.get(k))) ? +params.get(k) : d;
-  const DEBUG     = params.get('debug') === '1';
+  const VIEW      = params.get('view') || '';            // this screen only shows a phone's dashboard
+  const SHARE     = VIEW ? '' : (params.get('share') || '');   // this phone shares its dashboard
+  const DEBUG     = params.get('debug') === '1' || !!VIEW;
   const USE_CANE  = params.get('baston') === '1';
   const MODEL     = params.get('model') || 'lite0';           // lite0 | lite2 | ssd
-  let USE_VOICE   = params.get('voce') === '1' || DEBUG;
+  let USE_VOICE   = !VIEW && (params.get('voce') === '1' || DEBUG);
   let VFOV_DEG    = num('fov', 0);        // camera vertical field of view (portrait); 0 = auto 64°
   let CORRIDOR_HALF_M = num('lat', 0.5);  // half the width of my walking path
   let CAM_OFFSET_M    = num('off', 0);    // camera right of body centre (+) / left (-)
@@ -153,6 +157,10 @@
     const e = { t: Date.now(), type, text, ...(extra || {}) };
     events.push(e);
     if (events.length > 3000) events.shift();
+    addLogLine(e);
+  }
+  function addLogLine(e) {
+    const { type, text } = e;
     if (DEBUG) {
       const el = $('log');
       const line = document.createElement('div');
@@ -650,7 +658,7 @@
       g.fillText(`${r} m`, X(0) + 3, Y(r) + 11);
     }
     // camera field of view
-    const W = video.videoWidth || 480, H = video.videoHeight || 640, half = hfovRad(W, H) / 2;
+    const W = vidW() || 480, H = vidH() || 640, half = hfovRad(W, H) / 2;
     g.strokeStyle = '#468'; g.beginPath();
     for (const s of [-1, 1]) { g.moveTo(X(CAM_OFFSET_M), Y(0)); g.lineTo(X(CAM_OFFSET_M + s * R * Math.tan(half)), Y(R)); }
     g.stroke();
@@ -767,12 +775,13 @@
 
   let lastTableDraw = 0;
   function drawStats(now) {
-    const fps = stats.frameTimes.length > 1 ? 1000 * (stats.frameTimes.length - 1) / (stats.frameTimes[stats.frameTimes.length - 1] - stats.frameTimes[0]) : 0;
+    const fps = currentFps();
     stats.pkts = stats.pkts.filter(t => now - t < 2000);
-    const W = video.videoWidth, H = video.videoHeight;
+    const W = vidW(), H = vidH();
     const conf = tracks.filter(t => t.hits >= CONFIRM_HITS);
     $('stats').textContent = [
-      `model     ${detector ? detector.name : '—'}   ${running ? 'RUNNING' : 'stopped'}`,
+      shareStatus(now),
+      `model     ${VIEW ? remote.model || '—' : detector ? detector.name : '—'}   ${running ? 'RUNNING' : 'stopped'}`,
       `speed     ${stats.inferMs.toFixed(0)} ms/frame, ${fps.toFixed(1)} fps`,
       `video     ${W || '—'}x${H || '—'}  vfov ${W ? (vfovRad(W, H) * 180 / Math.PI).toFixed(0) : '—'}°  hfov ${W ? (hfovRad(W, H) * 180 / Math.PI).toFixed(0) : '—'}°`,
       `tilt      ${pitchDown == null ? 'no sensor / landscape (height-only distance)' : (pitchDown * 180 / Math.PI).toFixed(1) + '° down'}  cam height ${CAM_H_M.toFixed(2)} m`,
@@ -845,6 +854,138 @@
     a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' }));
     a.download = `baston-log-${Date.now()}.json`;
     a.click();
+  }
+
+  // ================= Sharing the dashboard to other screens (v4.2) =================
+  // Phone: ?share=CODE. Laptop/tablet: ?view=CODE. Only numbers and boxes travel, never images.
+  const PEERJS_URL = params.get('peerjs') || 'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';
+  const peerId = code => `actseed-baston05-${code.toLowerCase().replace(/[^a-z0-9-]/g, '')}`;
+  function peerOpts() {          // default: free PeerJS cloud server (+ its TURN relay)
+    if (!params.get('peerhost')) return {};
+    return { host: params.get('peerhost'), port: +(params.get('peerport') || 443),
+             path: params.get('peerpath') || '/', secure: params.get('peersecure') !== '0' };
+  }
+  const vidW = () => VIEW ? remote.W : video.videoWidth;
+  const vidH = () => VIEW ? remote.H : video.videoHeight;
+  function currentFps() {
+    if (VIEW) return remote.fps || 0;
+    const f = stats.frameTimes;
+    return f.length > 1 ? 1000 * (f.length - 1) / (f[f.length - 1] - f[0]) : 0;
+  }
+
+  // ---- phone side ----
+  let peer = null, viewers = [], lastSentT = 0;
+  function startShare() {
+    if (!SHARE || peer) return;
+    loadScript(PEERJS_URL).then(() => {
+      peer = new Peer(peerId(SHARE), peerOpts());
+      peer.on('open', id => logEvent('share', `sharing as "${SHARE}" - open ?view=${SHARE} on the other screen`));
+      peer.on('connection', c => {
+        c.on('open', () => {
+          viewers.push(c);
+          logEvent('share', `screen connected (${viewers.length} watching)`);
+          c.send(stateMsg(0));                            // full history for the new screen
+        });
+        c.on('close', () => { viewers = viewers.filter(v => v !== c); logEvent('share', `screen left (${viewers.length} watching)`); });
+        c.on('error', () => { viewers = viewers.filter(v => v !== c); });
+      });
+      peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) {} });
+      peer.on('error', e => {
+        logEvent('share', `share error: ${e.type}`);
+        if (['unavailable-id', 'network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) {
+          try { peer.destroy(); } catch (x) {}
+          peer = null;
+          setTimeout(startShare, 5000);                   // id still held by an old session, or no internet
+        }
+      });
+    }).catch(() => logEvent('share', 'PeerJS could not be loaded (no internet?)'));
+  }
+  const slim = t => ({ id: t.id, cls: t.cls, votes: t.votes, box: t.box, hits: t.hits, misses: t.misses, score: t.score,
+                       dH: t.dH, dG: t.dG, src: t.src, dist: t.dist, camDist: t.camDist, fused: t.fused,
+                       bearing: t.bearing, bearL: t.bearL, bearR: t.bearR, lateral: t.lateral, inPath: t.inPath,
+                       side: t.side, approaching: t.approaching, why: t.why, trail: t.trail });
+  function stateMsg(since) {
+    return {
+      v: 1, now: Date.now(), tracks: tracks.map(slim), raw: lastRawDets,
+      W: video.videoWidth || 0, H: video.videoHeight || 0, running, caneConnected,
+      model: detector ? detector.name : '', inferMs: stats.inferMs, fps: currentFps(), spoken: stats.spoken,
+      scaleN: stats.scaleN, pitchDown, camScale,
+      set: { VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS },
+      dbg: dbgHist.filter(q => q.t > since), cane: caneHist.filter(c => c[0] > since),
+      ev: events.filter(e => e.t > since).slice(-200)
+    };
+  }
+  setInterval(() => {
+    if (!viewers.length) return;
+    const m = stateMsg(lastSentT);
+    lastSentT = m.now;
+    for (const c of viewers) if (c.open) { try { c.send(m); } catch (e) {} }
+  }, 100);
+
+  // ---- viewer side ----
+  const remote = { W: 480, H: 640, fps: 0, model: '', last: 0, connected: false, dbgT: 0, caneT: 0, evT: 0 };
+  function applyState(m) {
+    const off = Date.now() - m.now;                     // phone clock -> this screen's clock
+    remote.last = Date.now();
+    tracks = m.tracks || []; lastRawDets = m.raw || [];
+    remote.W = m.W || 480; remote.H = m.H || 640; remote.fps = m.fps; remote.model = m.model;
+    running = m.running; caneConnected = m.caneConnected;
+    stats.inferMs = m.inferMs; stats.spoken = m.spoken; stats.scaleN = m.scaleN;
+    pitchDown = m.pitchDown; camScale = m.camScale;
+    ({ VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS } = m.set);
+    for (const q of m.dbg || []) {
+      if (q.t <= remote.dbgT) continue;
+      remote.dbgT = q.t;
+      const p = { ...q, t: q.t + off };
+      dbgHist.push(p); stats.pkts.push(p.t);
+    }
+    while (dbgHist.length && Date.now() - dbgHist[0].t > 12000) dbgHist.shift();
+    for (const [t, cm] of m.cane || []) {
+      if (t <= remote.caneT) continue;
+      remote.caneT = t; pushCane(t + off, cm);
+    }
+    for (const e of m.ev || []) {
+      if (e.t <= remote.evT) continue;
+      remote.evT = e.t;
+      const le = { ...e, t: e.t + off };
+      events.push(le); addLogLine(le);
+    }
+    drawOverlay(remote.W, remote.H, Date.now());
+  }
+  function connectViewer() {
+    loadScript(PEERJS_URL).then(() => {
+      const p = new Peer(peerOpts());
+      let retry = null;
+      const again = () => { if (!retry) retry = setTimeout(() => { retry = null; open(); }, 3000); };
+      setInterval(() => {                                // phone switched off / out of range: notice fast
+        if (remote.connected && Date.now() - remote.last > 5000) {
+          remote.connected = false;
+          logEvent('share', 'no data for 5 s, reconnecting…');
+          try { remote.conn && remote.conn.close(); } catch (e) {}
+          again();
+        }
+      }, 1000);
+      const open = () => {
+        const c = p.connect(peerId(VIEW), { serialization: 'json', reliable: true });
+        remote.conn = c;
+        c.on('open', () => { remote.connected = true; remote.last = Date.now(); logEvent('share', `connected to phone "${VIEW}"`); });
+        c.on('data', m => { if (remote.conn === c) { remote.connected = true; applyState(m); } });
+        c.on('close', () => { if (remote.conn !== c) return; remote.connected = false; logEvent('share', 'phone gone, retrying…'); again(); });
+        c.on('error', () => again());
+      };
+      p.on('open', open);
+      p.on('disconnected', () => { try { p.reconnect(); } catch (e) {} });
+      p.on('error', e => { logEvent('share', `waiting for phone "${VIEW}" (${e.type})`); again(); });
+    }).catch(() => logEvent('share', 'PeerJS could not be loaded (no internet?)'));
+  }
+  function shareStatus(now) {
+    if (VIEW) {
+      const age = remote.last ? ((now - remote.last) / 1000).toFixed(1) + ' s ago' : 'never';
+      const live = remote.connected && now - remote.last < 2000;
+      return `viewer    phone "${VIEW}": ${live ? 'LIVE' : remote.connected ? 'connected, no data' : 'not connected'}, last data ${age}`;
+    }
+    if (SHARE) return `sharing   "${SHARE}": ${peer && peer.open ? 'online' : 'offline'}, ${viewers.length} screen(s) watching`;
+    return 'sharing   off (add &share=CODE)';
   }
 
   // ================= Main loop =================
@@ -922,6 +1063,12 @@
   }
   btn.addEventListener('click', toggle);
 
+  if (VIEW) {
+    document.title = `Baston – dashboard (${VIEW})`;
+    for (const id of ['bStart', 'bCane', 'bVoice']) $(id).style.display = 'none';
+    $('controls').parentElement.style.display = 'none';
+    $('view').previousElementSibling.textContent = 'Phone camera: detections only. No video leaves the phone (privacy rule).';
+  }
   if (DEBUG) {
     document.body.classList.add('debug');
     $('view').append(video, canvas);
@@ -931,10 +1078,13 @@
     bv.textContent = `Voice: ${USE_VOICE ? 'on' : 'off'}`;
     bv.addEventListener('click', () => { USE_VOICE = !USE_VOICE; bv.textContent = `Voice: ${USE_VOICE ? 'on' : 'off'}`; });
     $('bExport').addEventListener('click', exportLog);
-    buildControls();
+    if (!VIEW) buildControls();
     requestAnimationFrame(dashLoop);
-    logEvent('info', 'debug mode. Start camera, connect cane (Android/desktop Chrome), walk.');
+    logEvent('info', VIEW ? `viewer: waiting for the phone sharing "${VIEW}"`
+                          : 'debug mode. Start camera, connect cane (Android/desktop Chrome), walk.');
   }
+  if (VIEW) connectViewer();
+  if (SHARE) startShare();
   setLabel('Pornește detectarea');
   </script>
 </body>
