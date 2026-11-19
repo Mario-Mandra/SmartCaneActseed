@@ -84,8 +84,8 @@
   // Cane over Bluetooth (?baston=1): its measured distance names the object in front, corrects the
   // camera's distance scale over time, and gives "Obstacol" when the camera can't name what the cane feels.
   // ?debug=1 = developer dashboard. Frames are processed in memory only, never stored or sent.
-  // v4.2: ?share=CODE on the phone streams detections + cane data (no images) to any number of
-  // screens opened with ?view=CODE (laptop, tablet), via WebRTC (PeerJS).
+  // v4.2+: ?share=CODE on the phone streams detections + cane data (no images) to any number of
+  // screens opened with ?view=CODE (laptop, tablet). v4.4: via MQTT (two public brokers at once).
 
   // ================= Settings =================
   const params = new URLSearchParams(location.search);
@@ -854,13 +854,15 @@
 
   // ================= Sharing the dashboard to other screens (v4.2) =================
   // Phone: ?share=CODE. Laptop/tablet: ?view=CODE. Only numbers and boxes travel, never images.
-  const PEERJS_URL = params.get('peerjs') || 'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';
-  const peerId = code => `actseed-baston05-${code.toLowerCase().replace(/[^a-z0-9-]/g, '')}`;
-  function peerOpts() {          // default: free PeerJS cloud server (+ its TURN relay)
-    if (!params.get('peerhost')) return {};
-    return { host: params.get('peerhost'), port: +(params.get('peerport') || 443),
-             path: params.get('peerpath') || '/', secure: params.get('peersecure') !== '0' };
-  }
+  // Transport (v4.4): MQTT over secure WebSockets through two free public brokers AT THE SAME TIME
+  // (if one is down or blocked, the other carries the data). No WebRTC, no IDs to reserve.
+  // Only numbers and boxes are published, never images. Topic = actseed/baston05/CODE.
+  const MQTT_URL = params.get('mqttjs') || 'https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js';
+  const BROKERS = params.get('broker') ? params.get('broker').split(',')
+                : ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
+  const topicOf = code => `actseed/baston05/${code.toLowerCase().replace(/[^a-z0-9-]/g, '')}`;
+  const SEND_MS = 200;                       // 5 messages per second
+  const round3 = (k, v) => typeof v === 'number' && !Number.isInteger(v) ? Math.round(v * 1000) / 1000 : v;
   const vidW = () => VIEW ? remote.W : video.videoWidth;
   const vidH = () => VIEW ? remote.H : video.videoHeight;
   function currentFps() {
@@ -868,72 +870,85 @@
     const f = stats.frameTimes;
     return f.length > 1 ? 1000 * (f.length - 1) / (f[f.length - 1] - f[0]) : 0;
   }
+  const clients = [];                        // one MQTT client per broker
+  const brokersUp = () => clients.filter(c => c.connected).length;
+  const hostOf = url => { try { return new URL(url).host; } catch (e) { return url; } };
+
+  function openBrokers(onConnect, onMessage) {
+    loadScript(MQTT_URL).then(() => {
+      for (const url of BROKERS) {
+        const c = mqtt.connect(url, {
+          clientId: `baston05-${VIEW ? 'view' : 'phone'}-${Math.random().toString(16).slice(2, 10)}`,
+          clean: true, keepalive: 20, reconnectPeriod: 2000, connectTimeout: 8000
+        });
+        c.on('connect', () => { logEvent('share', `online via ${hostOf(url)}`); onConnect(c); });
+        c.on('offline', () => logEvent('share', `lost ${hostOf(url)}, retrying…`));
+        c.on('error', e => logEvent('share', `${hostOf(url)}: ${e.message}`));
+        c.on('message', (t, buf) => onMessage(t, buf));
+        clients.push(c);
+      }
+    }).catch(() => logEvent('share', 'MQTT library could not be loaded (no internet?)'));
+  }
 
   // ---- phone side ----
+  const viewersSeen = {};                    // viewer id -> last hello
+  let lastSentT = 0, snapshotDue = false;
+  const viewerCount = () => Object.values(viewersSeen).filter(t => Date.now() - t < 12000).length;
+  function startShare() {
+    if (!SHARE) return;
+    const T = topicOf(SHARE);
+    openBrokers(c => c.subscribe(`${T}/hello`), (t, buf) => {
+      const id = buf.toString();
+      if (!viewersSeen[id] || Date.now() - viewersSeen[id] > 12000) {
+        snapshotDue = true;
+        logEvent('share', `screen connected (${viewerCount() + 1} watching)`);
+      }
+      viewersSeen[id] = Date.now();
+    });
+    setInterval(() => {
+      if (!brokersUp() || !viewerCount()) return;          // nobody watching: send nothing
+      const m = stateMsg(snapshotDue ? Date.now() - 3000 : lastSentT, snapshotDue ? 40 : 200);
+      snapshotDue = false;
+      lastSentT = m.now;
+      const body = JSON.stringify(m, round3);
+      for (const c of clients) if (c.connected) c.publish(`${T}/state`, body, { qos: 0 });
+    }, SEND_MS);
+  }
   function updateTopBar(now) {          // user mode: small status line for sighted helpers
     const parts = [];
     if (USE_CANE) {
       const us = caneMetres(now);
       parts.push(!caneConnected ? 'Baston: neconectat' : us == null ? 'Baston: liber' : `Baston: ${Math.round(us * 100)} cm`);
     }
-    if (SHARE) parts.push(peer && peer.open ? `Ecrane: ${viewers.length}` : `Partajare: se conectează…`);
+    if (SHARE) parts.push(brokersUp() ? `Ecrane: ${viewerCount()}` : 'Partajare: se conectează…');
     caneLabel.textContent = parts.join('   ·   ');
   }
   if (SHARE && !DEBUG) setInterval(() => updateTopBar(Date.now()), 1000);
-  let peer = null, viewers = [], lastSentT = 0;
-  function startShare() {
-    if (!SHARE || peer) return;
-    loadScript(PEERJS_URL).then(() => {
-      peer = new Peer(peerId(SHARE), peerOpts());
-      peer.on('open', id => logEvent('share', `sharing as "${SHARE}" - open ?view=${SHARE} on the other screen`));
-      peer.on('connection', c => {
-        c.on('open', () => {
-          viewers.push(c);
-          logEvent('share', `screen connected (${viewers.length} watching)`);
-          try { c.send(stateMsg(Date.now() - 3000, 40)); } // small snapshot: last 3 s (Safari limit ~64 KB)
-          catch (e) { logEvent('share', `snapshot failed: ${e}`); }
-        });
-        c.on('close', () => { viewers = viewers.filter(v => v !== c); logEvent('share', `screen left (${viewers.length} watching)`); });
-        c.on('error', () => { viewers = viewers.filter(v => v !== c); });
-      });
-      peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) {} });
-      peer.on('error', e => {
-        logEvent('share', `share error: ${e.type}`);
-        if (['unavailable-id', 'network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) {
-          try { peer.destroy(); } catch (x) {}
-          peer = null;
-          setTimeout(startShare, 5000);                   // id still held by an old session, or no internet
-        }
-      });
-    }).catch(() => logEvent('share', 'PeerJS could not be loaded (no internet?)'));
-  }
   const slim = t => ({ id: t.id, cls: t.cls, votes: t.votes, box: t.box, hits: t.hits, misses: t.misses, score: t.score,
                        dH: t.dH, dG: t.dG, src: t.src, dist: t.dist, camDist: t.camDist, fused: t.fused,
                        bearing: t.bearing, bearL: t.bearL, bearR: t.bearR, lateral: t.lateral, inPath: t.inPath,
                        side: t.side, approaching: t.approaching, why: t.why, trail: t.trail });
   function stateMsg(since, maxEv = 200) {
     return {
-      v: 1, now: Date.now(), tracks: tracks.map(slim), raw: lastRawDets,
+      v: 2, now: Date.now(), tracks: tracks.map(slim), raw: lastRawDets,
       W: video.videoWidth || 0, H: video.videoHeight || 0, running, caneConnected,
       model: detector ? detector.name : '', inferMs: stats.inferMs, fps: currentFps(), spoken: stats.spoken,
       scaleN: stats.scaleN, pitchDown, camScale,
       set: { VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS },
       dbg: dbgHist.filter(q => q.t > since), cane: caneHist.filter(c => c[0] > since),
-      ev: events.filter(e => e.t > since).slice(-maxEv)
+      ev: events.filter(e => e.t > since && e.type !== 'share').slice(-maxEv)
     };
   }
-  setInterval(() => {
-    if (!viewers.length) return;
-    const m = stateMsg(lastSentT);
-    lastSentT = m.now;
-    for (const c of viewers) if (c.open) { try { c.send(m); } catch (e) {} }
-  }, 100);
 
   // ---- viewer side ----
-  const remote = { W: 480, H: 640, fps: 0, model: '', last: 0, connected: false, dbgT: 0, caneT: 0, evT: 0 };
+  const remote = { W: 480, H: 640, fps: 0, model: '', last: 0, lastNow: 0, connected: false, dbgT: 0, caneT: 0, evT: 0 };
   function applyState(m) {
+    if (Date.now() - remote.last > 3000)                // silence: a (new) phone may have a different clock
+      Object.assign(remote, { lastNow: 0, dbgT: 0, caneT: 0, evT: 0 });
+    if (m.now <= remote.lastNow) return;              // same message via the second broker / out of order
+    remote.lastNow = m.now;
     const off = Date.now() - m.now;                     // phone clock -> this screen's clock
-    remote.last = Date.now();
+    remote.last = Date.now(); remote.connected = true;
     tracks = m.tracks || []; lastRawDets = m.raw || [];
     remote.W = m.W || 480; remote.H = m.H || 640; remote.fps = m.fps; remote.model = m.model;
     running = m.running; caneConnected = m.caneConnected;
@@ -960,38 +975,26 @@
     drawOverlay(remote.W, remote.H, Date.now());
   }
   function connectViewer() {
-    loadScript(PEERJS_URL).then(() => {
-      const p = new Peer(peerOpts());
-      let retry = null;
-      const again = () => { if (!retry) retry = setTimeout(() => { retry = null; open(); }, 3000); };
-      setInterval(() => {                                // phone switched off / out of range: notice fast
-        if (remote.connected && Date.now() - remote.last > 5000) {
-          remote.connected = false;
-          logEvent('share', 'no data for 5 s, reconnecting…');
-          try { remote.conn && remote.conn.close(); } catch (e) {}
-          again();
-        }
-      }, 1000);
-      const open = () => {
-        const c = p.connect(peerId(VIEW), { serialization: 'json', reliable: true });
-        remote.conn = c;
-        c.on('open', () => { remote.connected = true; remote.last = Date.now(); logEvent('share', `connected to phone "${VIEW}"`); });
-        c.on('data', m => { if (remote.conn === c) { remote.connected = true; applyState(m); } });
-        c.on('close', () => { if (remote.conn !== c) return; remote.connected = false; logEvent('share', 'phone gone, retrying…'); again(); });
-        c.on('error', () => again());
-      };
-      p.on('open', open);
-      p.on('disconnected', () => { try { p.reconnect(); } catch (e) {} });
-      p.on('error', e => { logEvent('share', `waiting for phone "${VIEW}" (${e.type})`); again(); });
-    }).catch(() => logEvent('share', 'PeerJS could not be loaded (no internet?)'));
+    const T = topicOf(VIEW);
+    const myId = `v-${Math.random().toString(16).slice(2, 10)}`;
+    openBrokers(c => { c.subscribe(`${T}/state`); c.publish(`${T}/hello`, myId); }, (t, buf) => {
+      try { applyState(JSON.parse(buf.toString())); } catch (e) { console.warn(e); }
+    });
+    setInterval(() => { for (const c of clients) if (c.connected) c.publish(`${T}/hello`, myId); }, 4000);
+    setInterval(() => {
+      if (remote.connected && Date.now() - remote.last > 5000) {
+        remote.connected = false;
+        logEvent('share', 'no data from the phone for 5 s (phone off, screen locked or no internet?)');
+      }
+    }, 1000);
   }
   function shareStatus(now) {
     if (VIEW) {
       const age = remote.last ? ((now - remote.last) / 1000).toFixed(1) + ' s ago' : 'never';
       const live = remote.connected && now - remote.last < 2000;
-      return `viewer    phone "${VIEW}": ${live ? 'LIVE' : remote.connected ? 'connected, no data' : 'not connected'}, last data ${age}`;
+      return `viewer    phone "${VIEW}": ${live ? 'LIVE' : 'waiting'}, last data ${age}, brokers ${brokersUp()}/${BROKERS.length}`;
     }
-    if (SHARE) return `sharing   "${SHARE}": ${peer && peer.open ? 'online' : 'offline'}, ${viewers.length} screen(s) watching`;
+    if (SHARE) return `sharing   "${SHARE}": brokers ${brokersUp()}/${BROKERS.length}, ${viewerCount()} screen(s) watching`;
     return 'sharing   off (add &share=CODE)';
   }
 
