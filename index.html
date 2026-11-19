@@ -628,11 +628,7 @@
       const lat = t.lateral == null ? '' : `, ${t.lateral >= 0 ? '+' : ''}${t.lateral.toFixed(1)} m`;
       ctx.fillText(`${Math.round(t.bearing)}°${lat} ${t.inPath ? 'ÎN CALE' : ''}`, x + 4, y + 50);
     }
-    if (USE_CANE && !DEBUG) {
-      const us = caneMetres(now);
-      caneLabel.textContent = !caneConnected ? 'Baston: neconectat'
-        : us == null ? 'Baston: liber' : `Baston: ${Math.round(us * 100)} cm`;
-    }
+    if ((USE_CANE || SHARE) && !DEBUG) updateTopBar(now);
   }
 
   // ================= Developer dashboard =================
@@ -874,6 +870,16 @@
   }
 
   // ---- phone side ----
+  function updateTopBar(now) {          // user mode: small status line for sighted helpers
+    const parts = [];
+    if (USE_CANE) {
+      const us = caneMetres(now);
+      parts.push(!caneConnected ? 'Baston: neconectat' : us == null ? 'Baston: liber' : `Baston: ${Math.round(us * 100)} cm`);
+    }
+    if (SHARE) parts.push(peer && peer.open ? `Ecrane: ${viewers.length}` : `Partajare: se conectează…`);
+    caneLabel.textContent = parts.join('   ·   ');
+  }
+  if (SHARE && !DEBUG) setInterval(() => updateTopBar(Date.now()), 1000);
   let peer = null, viewers = [], lastSentT = 0;
   function startShare() {
     if (!SHARE || peer) return;
@@ -884,7 +890,8 @@
         c.on('open', () => {
           viewers.push(c);
           logEvent('share', `screen connected (${viewers.length} watching)`);
-          c.send(stateMsg(0));                            // full history for the new screen
+          try { c.send(stateMsg(Date.now() - 3000, 40)); } // small snapshot: last 3 s (Safari limit ~64 KB)
+          catch (e) { logEvent('share', `snapshot failed: ${e}`); }
         });
         c.on('close', () => { viewers = viewers.filter(v => v !== c); logEvent('share', `screen left (${viewers.length} watching)`); });
         c.on('error', () => { viewers = viewers.filter(v => v !== c); });
@@ -904,7 +911,7 @@
                        dH: t.dH, dG: t.dG, src: t.src, dist: t.dist, camDist: t.camDist, fused: t.fused,
                        bearing: t.bearing, bearL: t.bearL, bearR: t.bearR, lateral: t.lateral, inPath: t.inPath,
                        side: t.side, approaching: t.approaching, why: t.why, trail: t.trail });
-  function stateMsg(since) {
+  function stateMsg(since, maxEv = 200) {
     return {
       v: 1, now: Date.now(), tracks: tracks.map(slim), raw: lastRawDets,
       W: video.videoWidth || 0, H: video.videoHeight || 0, running, caneConnected,
@@ -912,7 +919,7 @@
       scaleN: stats.scaleN, pitchDown, camScale,
       set: { VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS },
       dbg: dbgHist.filter(q => q.t > since), cane: caneHist.filter(c => c[0] > since),
-      ev: events.filter(e => e.t > since).slice(-200)
+      ev: events.filter(e => e.t > since).slice(-maxEv)
     };
   }
   setInterval(() => {
