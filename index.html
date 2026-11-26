@@ -8,9 +8,12 @@
   <meta name="theme-color" content="#000000">
   <style>
     html, body { margin: 0; height: 100%; background: #000; color: #fff;
-                 font-family: system-ui, sans-serif; }
+                 font-family: system-ui, sans-serif; overscroll-behavior: none; }
+    /* v4.6: no pull-to-refresh, no text selection / long-press menu on the big button */
     #main { position: fixed; inset: 0; width: 100%; height: 100%; border: 0;
-            padding: 0; background: #000; color: #fff; cursor: pointer; }
+            padding: 0; background: #000; color: #fff; cursor: pointer;
+            touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+    #hold { position: absolute; left: 0; bottom: 0; height: 12px; width: 0; background: #f33; }
     #main:focus-visible { outline: 6px solid #ff0; outline-offset: -6px; }
     #main video, #main canvas { position: absolute; inset: 0; width: 100%; height: 100%;
                                 object-fit: cover; }
@@ -46,6 +49,10 @@
     .ctl input { width: 100%; }
     #urlOut { word-break: break-all; color: #9f9; font-size: 11px; }
     #caneCfgInfo { color: #c6f; margin-bottom: 4px; }
+    #linkBanner { display: none; padding: 8px 10px; margin-bottom: 6px; border-radius: 4px; font-weight: 600; }
+    body.debug #linkBanner { display: block; }
+    #linkBanner.ok { background: #143; color: #9f9; }
+    #linkBanner.bad { background: #411; color: #fbb; }
   </style>
 </head>
 <body>
@@ -55,6 +62,7 @@
     <canvas id="overlay" aria-hidden="true"></canvas>
     <span id="cane" aria-hidden="true"></span>
     <span id="label">Pornește detectarea</span>
+    <span id="hold" aria-hidden="true"></span>
   </button>
   <div id="live" class="sr-only" aria-live="assertive" aria-atomic="true"></div>
 
@@ -66,6 +74,7 @@
       <button id="bVoice" type="button">Voice: on</button>
       <button id="bExport" type="button">Export log (JSON)</button>
     </div>
+    <div id="linkBanner"></div>
     <div id="grid">
       <div class="panel"><h3>Camera + detections (grey dashed = seen by the model, filtered out)</h3><div id="view"></div></div>
       <div class="panel"><h3>Top-down map (you at the bottom, metres)</h3><canvas id="radar" height="360"></canvas></div>
@@ -73,7 +82,7 @@
       <div class="panel"><h3>Cane sensor – side view</h3><canvas id="side" height="220"></canvas></div>
       <div class="panel"><h3>Status</h3><div id="stats"></div></div>
       <div class="panel"><h3>Cane vibration settings (saved on the cane)</h3><div id="caneCfgInfo"></div><div id="caneCfgCtl"></div></div>
-      <div class="panel"><h3>Camera tuning (live)</h3><div id="controls"></div><div id="urlOut"></div></div>
+      <div class="panel"><h3>Camera tuning (applied on the phone, saved there)</h3><div id="controls"></div><div id="urlOut"></div></div>
       <div class="panel" style="grid-column: 1 / -1"><h3>Tracks</h3><div style="overflow-x:auto"><table id="tracks"></table></div></div>
       <div class="panel" style="grid-column: 1 / -1"><h3>Log (spoken + decisions)</h3><div id="log"></div></div>
     </div>
@@ -92,10 +101,18 @@
   // v4.5: cane firmware v4.5 senses to 4 m (vibrates only in its own zone); dashboard reads and
   // changes the cane's vibration settings over Bluetooth, "Feel the rhythms" button, 4.5 m plots,
   // side view with head/waist height. Works with older firmware (settings panel then says so).
+  // v4.6: phone - one tap (TalkBack: double-tap) starts; STOP needs holding 2 s (or 3 taps within
+  // 3 s), so accidental touches do nothing while running; no pull-to-refresh. Sharing - two extra
+  // brokers on port 443 (venue Wi-Fi often blocks 8884/8084), per-broker status on both screens.
+  // Dashboard (?view=CODE) now sends all tuning: cane vibration settings, rhythm demo, camera
+  // tuning, voice on/off. The phone applies it (camera tuning saved on the phone) and logs it.
 
   // ================= Settings =================
   const params = new URLSearchParams(location.search);
-  const num = (k, d) => (params.has(k) && params.get(k) !== '' && !isNaN(+params.get(k))) ? +params.get(k) : d;
+  let saved = {};                         // v4.6: camera tuning sent from the dashboard, kept on the phone
+  try { saved = JSON.parse(localStorage.getItem('baston.cam') || '{}') || {}; } catch (e) {}
+  const num = (k, d) => (params.has(k) && params.get(k) !== '' && !isNaN(+params.get(k))) ? +params.get(k)
+                      : (typeof saved[k] === 'number' ? saved[k] : d);
   const VIEW      = params.get('view') || '';            // this screen only shows a phone's dashboard
   const SHARE     = VIEW ? '' : (params.get('share') || '');   // this phone shares its dashboard
   const DEBUG     = params.get('debug') === '1' || !!VIEW;
@@ -173,7 +190,7 @@
       const line = document.createElement('div');
       const ts = new Date(e.t).toTimeString().slice(0, 8);
       line.textContent = `${ts} [${type}] ${text}`;
-      line.style.color = type === 'say' ? '#ff6' : type === 'error' ? '#f66' : '#aaa';
+      line.style.color = type === 'say' ? '#ff6' : type === 'error' ? '#f66' : type === 'remote' ? '#6cf' : '#aaa';
       el.prepend(line);
       while (el.childNodes.length > 80) el.lastChild.remove();
     }
@@ -869,7 +886,7 @@
 
   function dashLoop() {
     const now = Date.now();
-    try { drawRadar(now); drawCanePlot(now); drawSide(now); drawStats(now); } catch (e) { console.error(e); }
+    try { drawRadar(now); drawCanePlot(now); drawSide(now); drawStats(now); updateBanner(now); } catch (e) { console.error(e); }
     requestAnimationFrame(dashLoop);
   }
 
@@ -889,7 +906,9 @@
       const inp = row.querySelector('input'), out = row.querySelector('span:last-child');
       inp.value = get(); out.textContent = key === 'fov' && !get() ? 'auto' : (+get()).toFixed(2);
       inp.addEventListener('input', () => { set(+inp.value); out.textContent = key === 'fov' && !+inp.value ? 'auto' : (+inp.value).toFixed(2); updateUrl(); });
-      row.dataset.key = key; box.appendChild(row);
+      // dashboard: the value goes to the phone when the slider is released (the phone applies and saves it)
+      if (VIEW) inp.addEventListener('change', () => sendCmd('cam', { set: { [key]: +inp.value } }));
+      row.dataset.key = key; row._get = get; box.appendChild(row);
     }
     function updateUrl() {
       const p = new URLSearchParams();
@@ -900,9 +919,14 @@
       $('urlOut').textContent = 'User-mode URL with these settings: ' + location.origin + location.pathname + '?' + p.toString() + '&baston=1';
     }
     updateUrl();
-    setInterval(() => {   // keep the scale slider in step with what the cane taught
-      const r = box.querySelector('[data-key="scale"]');
-      if (r && document.activeElement !== r.querySelector('input')) { r.querySelector('input').value = camScale; r.querySelector('span:last-child').textContent = camScale.toFixed(2); }
+    setInterval(() => {   // keep the sliders in step with the phone (cane-taught scale, dashboard changes)
+      for (const r of box.querySelectorAll('.ctl')) {
+        const inp = r.querySelector('input');
+        if (document.activeElement === inp) continue;
+        const v = r._get();
+        inp.value = v; r.querySelector('span:last-child').textContent = r.dataset.key === 'fov' && !v ? 'auto' : (+v).toFixed(2);
+      }
+      updateUrl();
     }, 1000);
   }
 
@@ -929,26 +953,31 @@
     const bar = document.createElement('div'); bar.className = 'btnrow';
     bar.innerHTML = '<button type="button" id="bCfgSend">Send to cane</button>' +
                     '<button type="button" id="bDemo">Feel the rhythms</button>' +
-                    '<button type="button" id="bCfgReset">Factory settings</button>';
+                    '<button type="button" id="bCfgReset">Factory settings</button>' +
+                    (VIEW ? '<button type="button" id="bReconnect">Reconnect cane</button>' : '');
     box.appendChild(bar);
+    // On the dashboard (?view=) every button goes to the phone, which passes it to the cane over Bluetooth.
     $('bCfgSend').addEventListener('click', () => {
       const v = k => +cfgInputs[k].inp.value;
       const s = { vibFar: v('vibFar'), cont: v('cont'), pulse: v('pulse'), gaps: [v('g0'), v('g1'), v('g2')], hold: v('hold') };
       const err = checkCfg(s);
       if (err) { logEvent('error', err); return; }
-      writeCfgBytes(cfgBytes(s), `settings sent: vibrate to ${s.vibFar} cm, continuous ${s.cont || 'auto'}, buzz ${s.pulse} ms, gaps ${s.gaps.join('/')} ms, hold ${s.hold} ms`);
+      if (VIEW) sendCmd('cane-cfg', { cfg: s });
+      else writeCfgBytes(cfgBytes(s), `settings sent: vibrate to ${s.vibFar} cm, continuous ${s.cont || 'auto'}, buzz ${s.pulse} ms, gaps ${s.gaps.join('/')} ms, hold ${s.hold} ms`);
     });
-    $('bDemo').addEventListener('click', () => writeCfgBytes([1], 'rhythm demo: slow, medium, fast, continuous (2 s each)'));
-    $('bCfgReset').addEventListener('click', () => writeCfgBytes([2], 'factory settings restored'));
+    $('bDemo').addEventListener('click', () => VIEW ? sendCmd('cane-demo') : writeCfgBytes([1], 'rhythm demo: slow, medium, fast, continuous (2 s each)'));
+    $('bCfgReset').addEventListener('click', () => VIEW ? sendCmd('cane-factory') : writeCfgBytes([2], 'factory settings restored'));
+    if (VIEW) $('bReconnect').addEventListener('click', () => sendCmd('cane-reconnect'));
     showCfg();
   }
   function showCfg() {
     const c = caneCfg;
     $('caneCfgInfo').textContent = !c
-      ? (VIEW ? 'cane settings: not received yet' : 'Connect the cane (firmware v4.5+) to read and change its settings.')
+      ? (VIEW ? 'Cane settings not received: phone not live, cane not connected on the phone, or firmware older than v4.5.'
+              : 'Connect the cane (firmware v4.5+) to read and change its settings.')
       : `firmware v${(c.fw / 10).toFixed(1)}${c.bench ? ' BENCH' : ''}: buzz up to ${c.vibFar} cm, continuous below ${c.cont || c.tip + ' (tip)'} cm, ` +
         `buzz ${c.pulse} ms, gaps ${c.gaps.join('/')} ms, hold ${c.hold} ms, senses to ${c.sense} cm`;
-    if (!c || VIEW) return;
+    if (!c) return;
     const set = (k, v) => { if (cfgInputs[k]) { cfgInputs[k].inp.value = v; cfgInputs[k].out.textContent = k === 'cont' && !v ? 'auto' : v; } };
     set('vibFar', c.vibFar); set('cont', c.cont); set('pulse', c.pulse);
     set('g0', c.gaps[0]); set('g1', c.gaps[1]); set('g2', c.gaps[2]); set('hold', c.hold);
@@ -968,14 +997,22 @@
     a.click();
   }
 
-  // ================= Sharing the dashboard to other screens (v4.2) =================
+  // ================= Sharing the dashboard to other screens =================
   // Phone: ?share=CODE. Laptop/tablet: ?view=CODE. Only numbers and boxes travel, never images.
-  // Transport (v4.4): MQTT over secure WebSockets through two free public brokers AT THE SAME TIME
-  // (if one is down or blocked, the other carries the data). No WebRTC, no IDs to reserve.
-  // Only numbers and boxes are published, never images. Topic = actseed/baston05/CODE.
+  // MQTT over secure WebSockets through several free public brokers AT THE SAME TIME (duplicates are
+  // dropped). v4.6: two of them on port 443, the normal HTTPS port, because venue / university Wi-Fi
+  // often blocks the 8884 / 8084 ports the other two use.
+  // Topics: CODE/state (phone -> screens, only while a screen is watching), CODE/hello (screens ->
+  // phone, every 4 s), CODE/cmd (screens -> phone: tuning commands, v4.6).
+  function hostOf(url) { try { return new URL(url).host; } catch (e) { return url; } }
   const MQTT_URL = params.get('mqttjs') || 'https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js';
-  const BROKERS = params.get('broker') ? params.get('broker').split(',')
-                : ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
+  const BROKERS = params.get('broker') ? params.get('broker').split(',').map(url => ({ url, name: hostOf(url) }))
+    : [
+        { url: 'wss://mqtt.eclipseprojects.io:443/mqtt', name: 'eclipse:443' },
+        { url: 'wss://public.cloud.shiftr.io', name: 'shiftr:443', username: 'public', password: 'public' },
+        { url: 'wss://broker.hivemq.com:8884/mqtt', name: 'hivemq:8884' },
+        { url: 'wss://broker.emqx.io:8084/mqtt', name: 'emqx:8084' },
+      ];
   const topicOf = code => `actseed/baston05/${code.toLowerCase().replace(/[^a-z0-9-]/g, '')}`;
   const SEND_MS = 200;                       // 5 messages per second
   const round3 = (k, v) => typeof v === 'number' && !Number.isInteger(v) ? Math.round(v * 1000) / 1000 : v;
@@ -986,57 +1023,121 @@
     const f = stats.frameTimes;
     return f.length > 1 ? 1000 * (f.length - 1) / (f[f.length - 1] - f[0]) : 0;
   }
-  const clients = [];                        // one MQTT client per broker
-  const brokersUp = () => clients.filter(c => c.connected).length;
-  const hostOf = url => { try { return new URL(url).host; } catch (e) { return url; } };
+  const clients = [];                        // per broker: { b, c (MQTT client), err, lastHello }
+  const brokersUp = () => clients.filter(x => x.c.connected).length;
+  let mqttLoadFailed = false, shareStartedAt = 0;
+  const myViewerId = `v-${Math.random().toString(16).slice(2, 10)}`;
 
   function openBrokers(onConnect, onMessage) {
+    shareStartedAt = Date.now();
     loadScript(MQTT_URL).then(() => {
-      for (const url of BROKERS) {
-        const c = mqtt.connect(url, {
+      for (const b of BROKERS) {
+        const x = { b, c: null, err: 'connecting', lastHello: 0, wasUp: false };
+        x.c = mqtt.connect(b.url, {
           clientId: `baston05-${VIEW ? 'view' : 'phone'}-${Math.random().toString(16).slice(2, 10)}`,
-          clean: true, keepalive: 20, reconnectPeriod: 2000, connectTimeout: 8000
+          clean: true, keepalive: 20, reconnectPeriod: 3000, connectTimeout: 8000,
+          ...(b.username ? { username: b.username, password: b.password } : {})
         });
-        c.on('connect', () => { logEvent('share', `online via ${hostOf(url)}`); onConnect(c); });
-        c.on('offline', () => logEvent('share', `lost ${hostOf(url)}, retrying…`));
-        c.on('error', e => logEvent('share', `${hostOf(url)}: ${e.message}`));
-        c.on('message', (t, buf) => onMessage(t, buf));
-        clients.push(c);
+        x.c.on('connect', () => { x.err = ''; x.wasUp = true; logEvent('share', `online via ${b.name}`); onConnect(x); });
+        x.c.on('close', () => {
+          if (!x.wasUp) { if (x.err === 'connecting') x.err = 'unreachable'; }
+          else if (!x.err) { x.err = 'retrying'; logEvent('share', `lost ${b.name}, retrying…`); }
+        });
+        x.c.on('error', e => { x.err = String((e && e.message) || e).slice(0, 50); });
+        x.c.on('message', (t, buf) => onMessage(x, t, buf));
+        clients.push(x);
       }
-    }).catch(() => logEvent('share', 'MQTT library could not be loaded (no internet?)'));
+    }).catch(() => { mqttLoadFailed = true; logEvent('error', 'MQTT library could not be loaded (no internet?)'); });
+  }
+  function brokerList() {
+    if (mqttLoadFailed) return 'MQTT library not loaded (no internet)';
+    if (!clients.length) return 'starting…';
+    return clients.map(x => `${x.b.name} ${x.c.connected ? 'OK' : '✗' + (x.err ? ' ' + x.err : '')}`).join(' · ');
   }
 
   // ---- phone side ----
   const viewersSeen = {};                    // viewer id -> last hello
+  const recentCmds = new Map();              // command id -> time (each command arrives once per broker)
   let lastSentT = 0, snapshotDue = false;
   const viewerCount = () => Object.values(viewersSeen).filter(t => Date.now() - t < 12000).length;
   function startShare() {
     if (!SHARE) return;
     const T = topicOf(SHARE);
-    openBrokers(c => c.subscribe(`${T}/hello`), (t, buf) => {
-      const id = buf.toString();
-      if (!viewersSeen[id] || Date.now() - viewersSeen[id] > 12000) {
-        snapshotDue = true;
-        logEvent('share', `screen connected (${viewerCount() + 1} watching)`);
+    openBrokers(x => { x.c.subscribe(`${T}/hello`); x.c.subscribe(`${T}/cmd`, { qos: 1 }); }, (x, topic, buf) => {
+      if (topic.endsWith('/hello')) {
+        const id = buf.toString();
+        x.lastHello = Date.now();
+        if (!viewersSeen[id] || Date.now() - viewersSeen[id] > 12000) {
+          snapshotDue = true;
+          logEvent('share', `screen connected (${viewerCount() + 1} watching)`);
+        }
+        viewersSeen[id] = Date.now();
+      } else if (topic.endsWith('/cmd')) {
+        let m;
+        try { m = JSON.parse(buf.toString()); } catch (e) { return; }
+        if (!m || !m.id || recentCmds.has(m.id)) return;
+        recentCmds.set(m.id, Date.now());
+        for (const [k, t] of recentCmds) if (Date.now() - t > 60000) recentCmds.delete(k);
+        handleCmd(m);
       }
-      viewersSeen[id] = Date.now();
     });
     setInterval(() => {
-      if (!brokersUp() || !viewerCount()) return;          // nobody watching: send nothing
+      if (!viewerCount()) return;                          // nobody watching: send nothing
+      // only on the brokers a screen is actually reachable through (saves the phone's data)
+      const targets = clients.filter(x => x.c.connected && Date.now() - x.lastHello < 12000);
+      if (!targets.length) return;
       const m = stateMsg(snapshotDue ? Date.now() - 3000 : lastSentT, snapshotDue ? 40 : 200);
       snapshotDue = false;
       lastSentT = m.now;
       const body = JSON.stringify(m, round3);
-      for (const c of clients) if (c.connected) c.publish(`${T}/state`, body, { qos: 0 });
+      for (const x of targets) x.c.publish(`${T}/state`, body, { qos: 0 });
     }, SEND_MS);
   }
+
+  // Commands from the dashboard (v4.6). Every result is logged, and the log travels back to the screens.
+  const CAM_KEYS = { fov: v => VFOV_DEG = v, lat: v => CORRIDOR_HALF_M = v, off: v => CAM_OFFSET_M = v,
+                     h: v => CAM_H_M = v, bias: v => SCORE_BIAS = v, scale: v => camScale = v };
+  const CAM_LIMITS = { fov: [0, 90], lat: [0.2, 1.2], off: [-0.4, 0.4], h: [0.5, 1.6], bias: [-0.2, 0.3], scale: [0.6, 1.6] };
+  async function handleCmd(m) {
+    if (m.kind === 'cane-cfg') {
+      const s = m.cfg, err = s ? checkCfg(s) : 'empty';
+      if (err) { logEvent('error', `cane settings from screen refused: ${err}`); return; }
+      await writeCfgBytes(cfgBytes(s), `from screen: cane settings — buzz up to ${s.vibFar} cm, continuous ${s.cont || 'auto'}, buzz ${s.pulse} ms, gaps ${s.gaps.join('/')} ms, hold ${s.hold} ms`);
+    } else if (m.kind === 'cane-demo') {
+      await writeCfgBytes([1], 'from screen: rhythm demo (slow, medium, fast, continuous)');
+    } else if (m.kind === 'cane-factory') {
+      await writeCfgBytes([2], 'from screen: cane factory settings');
+    } else if (m.kind === 'cane-reconnect') {
+      if (caneConnected) logEvent('remote', 'cane already connected');
+      else if (caneDevice) { logEvent('remote', 'from screen: reconnecting the cane'); retryCane(); }
+      else logEvent('error', 'the cane was never connected on this phone: start detection on the phone first');
+    } else if (m.kind === 'cam') {
+      const applied = [];
+      for (const k in (m.set || {})) {
+        if (!CAM_KEYS[k] || typeof m.set[k] !== 'number') continue;
+        const [a, b] = CAM_LIMITS[k], v = Math.min(b, Math.max(a, m.set[k]));
+        CAM_KEYS[k](v); saved[k] = v; applied.push(`${k}=${v}`);
+      }
+      try { localStorage.setItem('baston.cam', JSON.stringify(saved)); } catch (e) {}
+      logEvent('remote', `from screen: camera ${applied.join(' ') || '(nothing valid)'}`);
+    } else if (m.kind === 'voice') {
+      USE_VOICE = !!m.on;
+      if (DEBUG) $('bVoice').textContent = `Voice: ${USE_VOICE ? 'on' : 'off'}`;
+      logEvent('remote', `from screen: phone voice ${USE_VOICE ? 'on' : 'off'}`);
+    }
+  }
+
   function updateTopBar(now) {          // user mode: small status line for sighted helpers
     const parts = [];
     if (USE_CANE) {
       const us = caneMetres(now);
       parts.push(!caneConnected ? 'Baston: neconectat' : us == null ? 'Baston: liber' : `Baston: ${Math.round(us * 100)} cm`);
     }
-    if (SHARE) parts.push(brokersUp() ? `Ecrane: ${viewerCount()}` : 'Partajare: se conectează…');
+    if (SHARE) {
+      const up = brokersUp();
+      parts.push(up ? `Ecrane: ${viewerCount()} · servere ${up}/${BROKERS.length}`
+                    : Date.now() - shareStartedAt < 15000 ? 'Partajare: se conectează…' : 'Partajare: niciun server (rețea blocată?)');
+    }
     caneLabel.textContent = parts.join('   ·   ');
   }
   if (SHARE && !DEBUG) setInterval(() => updateTopBar(Date.now()), 1000);
@@ -1046,10 +1147,10 @@
                        side: t.side, approaching: t.approaching, why: t.why, trail: t.trail });
   function stateMsg(since, maxEv = 200) {
     return {
-      v: 2, now: Date.now(), tracks: tracks.map(slim), raw: lastRawDets,
+      v: 3, now: Date.now(), tracks: tracks.map(slim), raw: lastRawDets,
       W: video.videoWidth || 0, H: video.videoHeight || 0, running, caneConnected,
       model: detector ? detector.name : '', inferMs: stats.inferMs, fps: currentFps(), spoken: stats.spoken,
-      scaleN: stats.scaleN, pitchDown, camScale, caneCfg,
+      scaleN: stats.scaleN, pitchDown, camScale, caneCfg, voice: USE_VOICE, brokers: brokerList(),
       set: { VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS },
       dbg: dbgHist.filter(q => q.t > since), cane: caneHist.filter(c => c[0] > since),
       ev: events.filter(e => e.t > since && e.type !== 'share').slice(-maxEv)
@@ -1057,11 +1158,12 @@
   }
 
   // ---- viewer side ----
-  const remote = { W: 480, H: 640, fps: 0, model: '', last: 0, lastNow: 0, connected: false, dbgT: 0, caneT: 0, evT: 0, cfgJson: '' };
+  const remote = { W: 480, H: 640, fps: 0, model: '', last: 0, lastNow: 0, connected: false, dbgT: 0, caneT: 0, evT: 0,
+                   cfgJson: '', brokers: '' };
   function applyState(m) {
     if (Date.now() - remote.last > 3000)                // silence: a (new) phone may have a different clock
       Object.assign(remote, { lastNow: 0, dbgT: 0, caneT: 0, evT: 0 });
-    if (m.now <= remote.lastNow) return;              // same message via the second broker / out of order
+    if (m.now <= remote.lastNow) return;              // same message via another broker / out of order
     remote.lastNow = m.now;
     const off = Date.now() - m.now;                     // phone clock -> this screen's clock
     remote.last = Date.now(); remote.connected = true;
@@ -1070,7 +1172,9 @@
     running = m.running; caneConnected = m.caneConnected;
     stats.inferMs = m.inferMs; stats.spoken = m.spoken; stats.scaleN = m.scaleN;
     pitchDown = m.pitchDown; camScale = m.camScale;
-    const cj = JSON.stringify(m.caneCfg || null);       // v4.5: cane settings, shown read-only
+    remote.brokers = m.brokers || '';
+    if (typeof m.voice === 'boolean') { USE_VOICE = m.voice; $('bVoice').textContent = `Phone voice: ${USE_VOICE ? 'on' : 'off'}`; }
+    const cj = JSON.stringify(m.caneCfg || null);       // cane settings: refresh the panel only when they change
     if (cj !== remote.cfgJson) { remote.cfgJson = cj; caneCfg = m.caneCfg || null; showCfg(); }
     ({ VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS } = m.set);
     for (const q of m.dbg || []) {
@@ -1094,11 +1198,10 @@
   }
   function connectViewer() {
     const T = topicOf(VIEW);
-    const myId = `v-${Math.random().toString(16).slice(2, 10)}`;
-    openBrokers(c => { c.subscribe(`${T}/state`); c.publish(`${T}/hello`, myId); }, (t, buf) => {
+    openBrokers(x => { x.c.subscribe(`${T}/state`); x.c.publish(`${T}/hello`, myViewerId); }, (x, t, buf) => {
       try { applyState(JSON.parse(buf.toString())); } catch (e) { console.warn(e); }
     });
-    setInterval(() => { for (const c of clients) if (c.connected) c.publish(`${T}/hello`, myId); }, 4000);
+    setInterval(() => { for (const x of clients) if (x.c.connected) x.c.publish(`${T}/hello`, myViewerId); }, 4000);
     setInterval(() => {
       if (remote.connected && Date.now() - remote.last > 5000) {
         remote.connected = false;
@@ -1106,14 +1209,45 @@
       }
     }, 1000);
   }
+  // Dashboard -> phone. Sent on every connected broker; the phone runs each command once.
+  function sendCmd(kind, extra) {
+    const up = clients.filter(x => x.c.connected);
+    if (!up.length) { logEvent('error', `not sent (${kind}): this screen has no server connection`); return; }
+    if (!remote.connected) logEvent('error', `phone not live: "${kind}" may not arrive`);
+    const m = { id: `${myViewerId}-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, kind, ...(extra || {}) };
+    const body = JSON.stringify(m);
+    for (const x of up) x.c.publish(`${topicOf(VIEW)}/cmd`, body, { qos: 1 });
+    logEvent('remote', `sent to phone: ${kind}${extra ? ' ' + JSON.stringify(extra.set || extra.cfg || extra) : ''}`);
+  }
   function shareStatus(now) {
     if (VIEW) {
       const age = remote.last ? ((now - remote.last) / 1000).toFixed(1) + ' s ago' : 'never';
       const live = remote.connected && now - remote.last < 2000;
-      return `viewer    phone "${VIEW}": ${live ? 'LIVE' : 'waiting'}, last data ${age}, brokers ${brokersUp()}/${BROKERS.length}`;
+      return `viewer    phone "${VIEW}": ${live ? 'LIVE' : 'waiting'}, last data ${age}, servers ${brokersUp()}/${BROKERS.length}`;
     }
-    if (SHARE) return `sharing   "${SHARE}": brokers ${brokersUp()}/${BROKERS.length}, ${viewerCount()} screen(s) watching`;
+    if (SHARE) return `sharing   "${SHARE}": servers ${brokersUp()}/${BROKERS.length}, ${viewerCount()} screen(s) watching`;
     return 'sharing   off (add &share=CODE)';
+  }
+  // Big coloured line at the top of the dashboard: is this screen linked to the phone, and if not, why.
+  function updateBanner(now) {
+    const el = $('linkBanner');
+    if (VIEW) {
+      const live = remote.connected && now - remote.last < 2000;
+      el.className = live ? 'ok' : 'bad';
+      el.textContent = live
+        ? `LIVE — phone "${VIEW}" connected. This screen: ${brokerList()}. Phone: ${remote.brokers}`
+        : !brokersUp()
+          ? (Date.now() - shareStartedAt < 15000 ? `Connecting to the servers… (${brokerList()})`
+             : `This screen reaches no server: ${brokerList()}. Network blocks them — put this screen on the phone's hotspot.`)
+          : `Servers OK (${brokerList()}) but no data from the phone "${VIEW}". On the phone open …/?baston=1&share=${VIEW}, ` +
+            `keep its screen on and Chrome in front. Same code on both? Phone has internet?`;
+    } else if (SHARE) {
+      const n = viewerCount();
+      el.className = brokersUp() && n ? 'ok' : 'bad';
+      el.textContent = `Sharing "${SHARE}": ${n} screen(s) watching. Servers: ${brokerList()}`;
+    } else {
+      el.style.display = 'none';
+    }
   }
 
   // ================= Main loop =================
@@ -1166,8 +1300,8 @@
     running = true;
     keepAwake();
     const caneTxt = !USE_CANE ? '' : caneConnected ? ', baston conectat' : ', fără baston';
-    setLabel('Detectare pornită. Atinge pentru a opri.');
-    announce(`Detectare pornită${caneTxt}`);
+    setLabel('Detectare pornită. Pentru oprire, ține degetul pe ecran 2 secunde.');
+    announce(`Detectare pornită${caneTxt}. Pentru oprire, ține degetul pe ecran 2 secunde.`);
     loop();
   }
 
@@ -1189,13 +1323,54 @@
     busy = true;
     try { running ? stop() : await start(); } finally { busy = false; }
   }
-  btn.addEventListener('click', toggle);
+
+  // ================= Touch on the phone (v4.6) =================
+  // Blind users touch the screen by accident all the time. So:
+  //   not running: one tap (TalkBack: double-tap) starts - starting by accident is harmless
+  //   running:     taps do nothing; STOP = hold a finger on the screen 2 s (tick at 1 s, double buzz
+  //                when it stops), or 3 taps / TalkBack double-taps within 3 s (warned after the 2nd)
+  const HOLD_STOP_MS = 2000, TAP_WINDOW_MS = 3000;
+  const holdBar = $('hold');
+  let holdTimer = null, tickTimer = null, holdAnim = 0, holdT0 = 0, suppressClick = false, taps = [];
+  const buzzPhone = p => { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} };
+  function cancelHold() {
+    clearTimeout(holdTimer); clearTimeout(tickTimer); cancelAnimationFrame(holdAnim);
+    holdTimer = tickTimer = null; holdBar.style.width = '0';
+  }
+  function holdFrame() {
+    holdBar.style.width = `${Math.min(100, (performance.now() - holdT0) / HOLD_STOP_MS * 100)}%`;
+    if (holdTimer) holdAnim = requestAnimationFrame(holdFrame);
+  }
+  btn.addEventListener('pointerdown', () => {
+    if (!running || busy) return;
+    cancelHold();
+    holdT0 = performance.now();
+    tickTimer = setTimeout(() => buzzPhone(40), HOLD_STOP_MS / 2);
+    holdTimer = setTimeout(() => {
+      cancelHold();
+      suppressClick = true; setTimeout(() => { suppressClick = false; }, 1500);   // the release is not a "start"
+      buzzPhone([120, 80, 120]);
+      taps = [];
+      stop();
+    }, HOLD_STOP_MS);
+    holdAnim = requestAnimationFrame(holdFrame);
+  });
+  for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) btn.addEventListener(ev, cancelHold);
+  btn.addEventListener('contextmenu', e => e.preventDefault());
+  btn.addEventListener('click', () => {
+    if (suppressClick) { suppressClick = false; return; }
+    if (!running) { taps = []; toggle(); return; }
+    const now = Date.now();
+    taps = taps.filter(t => now - t < TAP_WINDOW_MS);
+    taps.push(now);
+    if (taps.length === 2) announce('Încă o atingere pentru oprire');
+    if (taps.length >= 3) { taps = []; stop(); }
+  });
 
   if (VIEW) {
+    // The dashboard: watches the phone and sends all tuning to it. It cannot start the phone's camera.
     document.title = `Baston – dashboard (${VIEW})`;
-    for (const id of ['bStart', 'bCane', 'bVoice']) $(id).style.display = 'none';
-    $('controls').parentElement.style.display = 'none';
-    $('caneCfgCtl').style.display = 'none';
+    for (const id of ['bStart', 'bCane']) $(id).style.display = 'none';
     $('view').previousElementSibling.textContent = 'Phone camera: detections only. No video leaves the phone (privacy rule).';
   }
   if (DEBUG) {
@@ -1204,12 +1379,15 @@
     $('bStart').addEventListener('click', toggle);
     $('bCane').addEventListener('click', connectCane);
     const bv = $('bVoice');
-    bv.textContent = `Voice: ${USE_VOICE ? 'on' : 'off'}`;
-    bv.addEventListener('click', () => { USE_VOICE = !USE_VOICE; bv.textContent = `Voice: ${USE_VOICE ? 'on' : 'off'}`; });
+    bv.textContent = `${VIEW ? 'Phone voice' : 'Voice'}: ${USE_VOICE ? 'on' : 'off'}`;
+    bv.addEventListener('click', () => {
+      if (VIEW) { sendCmd('voice', { on: !USE_VOICE }); return; }   // the phone confirms in its next update
+      USE_VOICE = !USE_VOICE; bv.textContent = `Voice: ${USE_VOICE ? 'on' : 'off'}`;
+    });
     $('bExport').addEventListener('click', exportLog);
-    if (!VIEW) { buildControls(); buildCaneCfg(); } else showCfg();
+    buildControls(); buildCaneCfg();
     requestAnimationFrame(dashLoop);
-    logEvent('info', VIEW ? `viewer: waiting for the phone sharing "${VIEW}"`
+    logEvent('info', VIEW ? `dashboard: waiting for the phone sharing "${VIEW}"`
                           : 'debug mode. Start camera, connect cane (Android/desktop Chrome), walk.');
   }
   if (VIEW) connectViewer();
