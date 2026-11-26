@@ -29,8 +29,9 @@
     body.debug #dash { display: block; padding: 6px; }
     #bar { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 6px;
            padding: 6px; background: #222; border-bottom: 1px solid #444; }
-    #bar button { font: inherit; padding: 8px 12px; background: #333; color: #fff;
-                  border: 1px solid #666; border-radius: 4px; }
+    #dash button { font: inherit; padding: 8px 12px; background: #333; color: #fff;
+                   border: 1px solid #666; border-radius: 4px; }
+    .btnrow { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
     #grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
     .panel { background: #1a1a1a; border: 1px solid #333; border-radius: 4px; padding: 6px; }
     .panel h3 { margin: 0 0 4px; font-size: 12px; color: #9cf; font-weight: 600; }
@@ -41,9 +42,10 @@
     #tracks { width: 100%; border-collapse: collapse; font-size: 11px; }
     #tracks td, #tracks th { border-bottom: 1px solid #333; padding: 2px 3px; text-align: left; white-space: nowrap; }
     #log { height: 220px; overflow-y: auto; white-space: pre-wrap; font-size: 11px; }
-    .ctl { display: grid; grid-template-columns: 110px 1fr 60px; gap: 4px; align-items: center; }
+    .ctl { display: grid; grid-template-columns: 150px 1fr 60px; gap: 4px; align-items: center; }
     .ctl input { width: 100%; }
     #urlOut { word-break: break-all; color: #9f9; font-size: 11px; }
+    #caneCfgInfo { color: #c6f; margin-bottom: 4px; }
   </style>
 </head>
 <body>
@@ -67,17 +69,18 @@
     <div id="grid">
       <div class="panel"><h3>Camera + detections (grey dashed = seen by the model, filtered out)</h3><div id="view"></div></div>
       <div class="panel"><h3>Top-down map (you at the bottom, metres)</h3><canvas id="radar" height="360"></canvas></div>
-      <div class="panel"><h3>Cane sensor – last 10 s (slant cm)</h3><canvas id="caneplot" height="220"></canvas></div>
-      <div class="panel"><h3>Cane sensor – side view</h3><canvas id="side" height="200"></canvas></div>
+      <div class="panel"><h3>Cane sensor – last 10 s (slant cm)</h3><canvas id="caneplot" height="260"></canvas></div>
+      <div class="panel"><h3>Cane sensor – side view</h3><canvas id="side" height="220"></canvas></div>
       <div class="panel"><h3>Status</h3><div id="stats"></div></div>
-      <div class="panel"><h3>Tuning (live)</h3><div id="controls"></div><div id="urlOut"></div></div>
+      <div class="panel"><h3>Cane vibration settings (saved on the cane)</h3><div id="caneCfgInfo"></div><div id="caneCfgCtl"></div></div>
+      <div class="panel"><h3>Camera tuning (live)</h3><div id="controls"></div><div id="urlOut"></div></div>
       <div class="panel" style="grid-column: 1 / -1"><h3>Tracks</h3><div style="overflow-x:auto"><table id="tracks"></table></div></div>
       <div class="panel" style="grid-column: 1 / -1"><h3>Log (spoken + decisions)</h3><div id="log"></div></div>
     </div>
   </div>
 
   <script>
-  // Baston v4 — Team 05.
+  // Baston v4.5 — Team 05.
   // Phone camera -> object detector (MediaPipe EfficientDet-Lite, fallback COCO-SSD) -> tracking with
   // class voting -> distance from object height AND from where it touches the ground (phone tilt sensor)
   // -> polar position -> THE LIST -> only what matters is spoken.
@@ -86,6 +89,9 @@
   // ?debug=1 = developer dashboard. Frames are processed in memory only, never stored or sent.
   // v4.2+: ?share=CODE on the phone streams detections + cane data (no images) to any number of
   // screens opened with ?view=CODE (laptop, tablet). v4.4: via MQTT (two public brokers at once).
+  // v4.5: cane firmware v4.5 senses to 4 m (vibrates only in its own zone); dashboard reads and
+  // changes the cane's vibration settings over Bluetooth, "Feel the rhythms" button, 4.5 m plots,
+  // side view with head/waist height. Works with older firmware (settings panel then says so).
 
   // ================= Settings =================
   const params = new URLSearchParams(location.search);
@@ -114,6 +120,7 @@
   const SVC_UUID  = 'ec8422ab-c76c-4afc-ab70-bbfa0dda990f';
   const DIST_UUID = '6bbc5371-56f1-40b2-a7f2-6d62bc96311e';
   const DBG_UUID  = '9d67ed6f-8121-4095-a5e4-d8d4bb529560';
+  const CFG_UUID  = '3c1a7e52-9b4d-4f0e-8a6c-2d5e7f9b1a40';   // firmware v4.5+: settings + commands
   const CANE_BODY_M = 0.35;     // must match BODY_OFFSET_CM in the firmware
   const SWEEP_MS = 700, UNKNOWN_M = 1.5, UNKNOWN_HOLD_MS = 600, UNKNOWN_REARM_MS = 2000;
   const FUSE_MAX_RATIO = 1.8;   // camera estimate must be within x1.8 of the cane to be matched
@@ -262,6 +269,7 @@
   let caneHist = [];     // [t, ahead-of-body cm or null]       (3 s, for fusion)
   let dbgHist = [];      // decoded dashboard packets            (12 s, for plots)
   let caneLog = [];      // [t, cm] 60 s, for export
+  let cfgCharRef = null, caneCfg = null;   // v4.5: cane settings channel and its last read value
 
   async function openCane() {
     const server = await caneDevice.gatt.connect();
@@ -278,6 +286,11 @@
       await dc.startNotifications();
       logEvent('cane', 'dashboard stream on');
     } catch (e) { logEvent('cane', 'no dashboard stream (firmware older than v4.2)'); }
+    try {                                           // firmware v4.5+: settings
+      cfgCharRef = await svc.getCharacteristic(CFG_UUID);
+      await readCfg();
+      if (caneCfg) logEvent('cane', `firmware v${(caneCfg.fw / 10).toFixed(1)}, settings channel on`);
+    } catch (e) { cfgCharRef = null; caneCfg = null; showCfg(); logEvent('cane', 'no settings channel (firmware older than v4.5)'); }
     caneConnected = true;
     logEvent('cane', 'connected');
   }
@@ -296,13 +309,47 @@
              motor: !!(f & 1), continuous: !!(f & 2), groundMode: !!(f & 4), bench: !!(f & 8),
              beamDown: dv.getInt8(11), sensorH: dv.getUint8(12),
              // firmware v4.4+: approach speed (cm/s, negative = approaching) and rhythm level 0-4
-             speed: dv.byteLength >= 15 ? dv.getInt16(13, true) : null, level: dv.byteLength >= 15 ? (f >> 4) & 7 : null };
+             speed: dv.byteLength >= 15 ? dv.getInt16(13, true) : null, level: dv.byteLength >= 15 ? (f >> 4) & 7 : null,
+             // firmware v4.5+: sensing range, rhythm demo running
+             sense: dv.byteLength >= 17 ? u(15) : null, demo: dv.byteLength >= 17 && !!(f & 0x80) };
   }
   function pushDbg(t, dv) {
     const p = decodeDbg(dv); p.t = t;
     dbgHist.push(p);
     while (dbgHist.length && t - dbgHist[0].t > 12000) dbgHist.shift();
     stats.pkts.push(t);
+  }
+
+  // ---- cane settings (firmware v4.5+) ----
+  function decodeCfg(dv) {
+    const g = i => dv.getUint16(i, true), fl = dv.getUint8(1);
+    return { fw: dv.getUint8(0), bench: !!(fl & 1), contAuto: !!(fl & 2), vibFar: g(2), cont: g(4), pulse: g(6),
+             gaps: [g(8), g(10), g(12)], hold: g(14), tip: g(16), sense: g(18) };
+  }
+  async function readCfg() {
+    if (!cfgCharRef) return;
+    try { caneCfg = decodeCfg(await cfgCharRef.readValue()); showCfg(); }
+    catch (e) { logEvent('cane', `settings read failed: ${e}`); }
+  }
+  async function writeCfgBytes(bytes, what) {
+    if (!cfgCharRef || !caneConnected) { logEvent('error', 'cane settings: connect the cane first (needs firmware v4.5)'); return; }
+    try {
+      const buf = new Uint8Array(bytes);
+      if (cfgCharRef.writeValueWithResponse) await cfgCharRef.writeValueWithResponse(buf);
+      else await cfgCharRef.writeValue(buf);
+      logEvent('cane', what);
+      setTimeout(readCfg, 400);
+    } catch (e) { logEvent('error', `cane settings not sent: ${e}`); }
+  }
+  function cfgBytes(s) {
+    const b = [0x45];
+    for (const v of [s.vibFar, s.cont, s.pulse, ...s.gaps, s.hold]) b.push(v & 255, (v >> 8) & 255);
+    return b;
+  }
+  function checkCfg(s) {   // same limits as the firmware
+    if (s.cont && s.cont < 20) return 'continuous must be 0 (= at the tip) or at least 20 cm';
+    if (s.cont && s.cont + 15 > s.vibFar) return 'continuous must end at least 15 cm before the vibration zone ends';
+    return '';
   }
 
   async function connectCane() {
@@ -322,6 +369,7 @@
   function onCaneLost() {
     caneConnected = false;
     caneHist = [];
+    cfgCharRef = null;
     logEvent('cane', 'disconnected');
     if (running || DEBUG) {
       if (running) announce('Baston deconectat');
@@ -670,6 +718,11 @@
       const c = ahead(p.cont), f = ahead(p.far);
       g.fillStyle = 'rgba(255,60,60,.12)'; g.fillRect(X(-cw), Y(c), 2 * cw * sc, (c - CANE_BODY_M) * sc);
       g.fillStyle = 'rgba(255,160,0,.10)'; g.fillRect(X(-cw), Y(f), 2 * cw * sc, (f - c) * sc);
+      if (p.sense != null) {                     // v4.5: sensing range (phone only, no vibration)
+        const s = ahead(p.sense);
+        g.fillStyle = 'rgba(80,160,255,.06)'; g.fillRect(X(-cw), Y(s), 2 * cw * sc, (s - f) * sc);
+        g.fillStyle = '#58a'; g.fillText('cane senses, no buzz', X(-cw) + 3, Y(s) + 11);
+      }
     }
     const us = caneMetres(now);
     if (us != null) {
@@ -702,13 +755,16 @@
 
   function drawCanePlot(now) {
     const [g, w, h] = prepCanvas($('caneplot'));
-    const T = 10000, MAXCM = 250;
+    const T = 10000, MAXCM = 450;
     const X = t => w - (now - t) / T * w, Y = cm => h - 4 - Math.min(cm, MAXCM) / MAXCM * (h - 8);
     g.strokeStyle = '#333'; g.fillStyle = '#666';
-    for (let cm = 50; cm <= 250; cm += 50) { g.beginPath(); g.moveTo(0, Y(cm)); g.lineTo(w, Y(cm)); g.stroke(); g.fillText(cm, 2, Y(cm) - 2); }
+    for (let cm = 50; cm <= MAXCM; cm += 50) {
+      g.beginPath(); g.moveTo(0, Y(cm)); g.lineTo(w, Y(cm)); g.stroke();
+      if (cm % 100 === 0) g.fillText(cm, 2, Y(cm) - 2);
+    }
     if (!dbgHist.length) {
       g.fillStyle = '#aaa';
-      g.fillText(caneConnected ? 'connected, no dashboard stream: flash cane_core v4.2' : 'cane not connected', 10, 20);
+      g.fillText(caneConnected ? 'connected, no dashboard stream: flash cane_core v4.2+' : 'cane not connected', 10, 20);
       // fall back to the plain distance channel
       g.strokeStyle = '#0cf'; g.beginPath(); let on = false;
       for (const [t, cm] of caneHist) { if (cm == null) { on = false; continue; } on ? g.lineTo(X(t), Y(cm)) : g.moveTo(X(t), Y(cm)); on = true; }
@@ -723,7 +779,7 @@
       for (const p of dbgHist) { const v = p[key]; if (v == null) { on = false; continue; } on ? g.lineTo(X(p.t), Y(v)) : g.moveTo(X(p.t), Y(v)); on = true; }
       g.stroke(); g.setLineDash([]);
     };
-    line('cont', '#f44', [4, 3]); line('far', '#fa0', [4, 3]); line('ground', '#a76', [2, 4]);
+    line('cont', '#f44', [4, 3]); line('far', '#fa0', [4, 3]); line('ground', '#a76', [2, 4]); line('sense', '#468', [2, 4]);
     if (dbgHist.some(q => q.level != null)) {            // rhythm level 0-4 as a step line (v4.4+)
       g.strokeStyle = '#c6f'; g.beginPath();
       dbgHist.forEach((q, i) => { const y = h - 12 - (q.level || 0) * 8; i ? g.lineTo(X(q.t), y) : g.moveTo(X(q.t), y); });
@@ -735,38 +791,50 @@
     const p = dbgHist[dbgHist.length - 1];
     g.fillStyle = '#ddd';
     const LV = ['off', 'slow', 'medium', 'fast', 'CONTINUOUS'];
-    const sp = p.speed == null ? '' : `  speed ${p.speed} cm/s${p.speed < -20 ? ' (approaching)' : ''}  rhythm ${LV[p.level] ?? p.level}`;
-    g.fillText(`raw ${p.raw ?? '—'}  filt ${p.filt ?? '—'}  cont<${p.cont}  far<${p.far}  ${p.groundMode ? 'floor ' + p.ground : 'no floor'}  ${p.bench ? 'BENCH' : ''}`, 30, 12);
+    const sp = p.speed == null ? '' : `  speed ${p.speed} cm/s${p.speed < -20 ? ' (approaching)' : ''}  rhythm ${LV[p.level] ?? p.level}${p.demo ? '  DEMO' : ''}`;
+    const floorTxt = p.groundMode ? 'floor ' + p.ground : p.sense != null ? `senses<${p.sense}` : 'no floor';
+    g.fillText(`raw ${p.raw ?? '—'}  filt ${p.filt ?? '—'}  cont<${p.cont}  buzz<${p.far}  ${floorTxt}  ${p.bench ? 'BENCH' : ''}`, 30, 12);
     if (sp) { g.fillStyle = '#c6f'; g.fillText(sp.trim(), 30, 38); g.fillStyle = '#ddd'; }
-    g.fillText('grey = raw ping, blue = filtered, red/orange dashed = limits, purple steps = rhythm level, red bar = motor', 30, 25);
+    g.fillText('grey = raw ping, blue = filtered, red/orange dashed = continuous/buzz limits, purple steps = rhythm, red bar = motor', 30, 25);
   }
 
   function drawSide(now) {
     const [g, w, h] = prepCanvas($('side'));
     const p = dbgHist[dbgHist.length - 1];
-    if (!p) { g.fillStyle = '#aaa'; g.fillText('needs firmware v4.2 + cane connected', 10, 20); return; }
-    const MAXX = 260, MAXY = 130, sc = Math.min((w - 20) / MAXX, (h - 20) / MAXY);
+    if (!p) { g.fillStyle = '#aaa'; g.fillText('needs firmware v4.2+ and the cane connected', 10, 20); return; }
+    const reach = Math.max(p.sense || 0, p.far || 0, 260);
+    const MAXX = reach + 10, MAXY = 220, sc = Math.min((w - 20) / MAXX, (h - 24) / MAXY);
     const X = cm => 10 + cm * sc, Y = cm => h - 10 - cm * sc;
     const sh = p.sensorH, bd = p.beamDown * Math.PI / 180, half = 15 * Math.PI / 180;
     g.strokeStyle = '#555'; g.beginPath(); g.moveTo(0, Y(0)); g.lineTo(w, Y(0)); g.stroke();      // floor
+    g.setLineDash([2, 4]); g.strokeStyle = '#444'; g.fillStyle = '#777';                        // body heights
+    for (const [hc, txt] of [[170, 'head'], [100, 'waist']]) {
+      g.beginPath(); g.moveTo(0, Y(hc)); g.lineTo(w, Y(hc)); g.stroke(); g.fillText(txt, w - 36, Y(hc) - 2);
+    }
+    g.setLineDash([]);
     const tipX = Math.max(0, (p.cont - 10) * Math.cos(bd));
     g.strokeStyle = '#ddd'; g.lineWidth = 3; g.beginPath(); g.moveTo(X(0), Y(sh)); g.lineTo(X(tipX), Y(0)); g.stroke(); g.lineWidth = 1;
-    // beam wedge, clipped by the floor
+    // beam wedge, clipped by the floor: faint to the sensing range, stronger in the vibration zone
     const ray = (a, r) => { let x = r * Math.cos(a), y = sh - r * Math.sin(a); if (y < 0) { const k = sh / (sh - y); x *= k; y = 0; } return [x, y]; };
-    g.fillStyle = 'rgba(80,160,255,.15)'; g.beginPath(); g.moveTo(X(0), Y(sh));
-    for (let a = bd - half; a <= bd + half + 1e-6; a += half / 8) { const [x, y] = ray(a, p.far); g.lineTo(X(x), Y(y)); }
-    g.closePath(); g.fill();
+    const wedge = (r, fill) => {
+      g.fillStyle = fill; g.beginPath(); g.moveTo(X(0), Y(sh));
+      for (let a = bd - half; a <= bd + half + 1e-6; a += half / 8) { const [x, y] = ray(a, r); g.lineTo(X(x), Y(y)); }
+      g.closePath(); g.fill();
+    };
+    if (p.sense) wedge(p.sense, 'rgba(80,160,255,.07)');
+    wedge(p.far, 'rgba(255,160,0,.16)');
     // zones along the beam axis
     const axis = r => ray(bd, r);
     const [cx, cy] = axis(p.cont); g.fillStyle = '#f44'; g.fillRect(X(cx) - 1, Y(cy) - 6, 2, 12); g.fillText('cont', X(cx) - 10, Y(cy) - 8);
-    const [fx, fy] = axis(p.far); g.fillStyle = '#fa0'; g.fillRect(X(fx) - 1, Y(fy) - 6, 2, 12); g.fillText('far', X(fx) - 8, Y(fy) - 8);
+    const [fx, fy] = axis(p.far); g.fillStyle = '#fa0'; g.fillRect(X(fx) - 1, Y(fy) - 6, 2, 12); g.fillText('buzz', X(fx) - 10, Y(fy) - 8);
     if (p.raw != null) { const [x, y] = axis(p.raw); g.fillStyle = '#999'; g.beginPath(); g.arc(X(x), Y(y), 3, 0, 7); g.fill(); }
     if (p.filt != null) {
-      g.strokeStyle = p.continuous ? '#f33' : '#fa0'; g.lineWidth = 3; g.beginPath();
+      g.strokeStyle = p.continuous ? '#f33' : p.filt < p.far ? '#fa0' : '#58a'; g.lineWidth = 3; g.beginPath();
       g.arc(X(0), Y(sh), p.filt * sc, bd - half, bd + half); g.stroke(); g.lineWidth = 1;
     }
     g.fillStyle = '#ddd';
-    g.fillText(`sensor ${sh} cm high, beam ${p.beamDown}° down, echo ${p.filt ?? '—'} cm, motor ${p.motor ? (p.continuous ? 'CONTINUOUS' : 'pulse') : 'off'}`, 10, 12);
+    const beamTxt = p.beamDown < 0 ? `${-p.beamDown}° up` : `${p.beamDown}° down`;
+    g.fillText(`sensor ${sh} cm high, beam ${beamTxt}, echo ${p.filt ?? '—'} cm, motor ${p.motor ? (p.continuous ? 'CONTINUOUS' : 'pulse') : 'off'}`, 10, 12);
   }
 
   let lastTableDraw = 0;
@@ -783,7 +851,7 @@
       `tilt      ${pitchDown == null ? 'no sensor / landscape (height-only distance)' : (pitchDown * 180 / Math.PI).toFixed(1) + '° down'}  cam height ${CAM_H_M.toFixed(2)} m`,
       `scale     camera distance x${camScale.toFixed(2)}  (${stats.scaleN} cane corrections)`,
       `tracks    ${tracks.length} total, ${conf.length} confirmed, ${conf.filter(cares).length} on THE LIST`,
-      `cane      ${caneConnected ? 'connected' : 'not connected'}, ${(stats.pkts.length / 2).toFixed(0)} pkt/s, sweep min ${caneMetres(now)?.toFixed(2) ?? '—'} m`,
+      `cane      ${caneConnected ? 'connected' : 'not connected'}${caneCfg ? ', firmware v' + (caneCfg.fw / 10).toFixed(1) : ''}, ${(stats.pkts.length / 2).toFixed(0)} pkt/s, sweep min ${caneMetres(now)?.toFixed(2) ?? '—'} m`,
       `spoken    ${stats.spoken}   voice ${USE_VOICE ? 'on' : 'off'}`
     ].join('\n');
     if (now - lastTableDraw < 250) return;
@@ -838,10 +906,58 @@
     }, 1000);
   }
 
+  // ---- cane vibration settings panel (v4.5) ----
+  const CFG_DEFS = [   // key, label, min, max, step
+    ['vibFar', 'vibrate up to (cm)', 60, 400, 10],
+    ['cont', 'continuous below (cm, 0=tip)', 0, 200, 5],
+    ['pulse', 'buzz length (ms)', 60, 600, 10],
+    ['g0', 'gap slow (ms)', 60, 2000, 10],
+    ['g1', 'gap medium (ms)', 60, 2000, 10],
+    ['g2', 'gap fast (ms)', 60, 2000, 10],
+    ['hold', 'hold after lost (ms)', 100, 2000, 50],
+  ];
+  const cfgInputs = {};
+  function buildCaneCfg() {
+    const box = $('caneCfgCtl');
+    for (const [k, name, mn, mx, st] of CFG_DEFS) {
+      const row = document.createElement('label'); row.className = 'ctl';
+      row.innerHTML = `<span>${name}</span><input type="range" min="${mn}" max="${mx}" step="${st}"><span>—</span>`;
+      const inp = row.querySelector('input'), out = row.querySelector('span:last-child');
+      inp.addEventListener('input', () => { out.textContent = k === 'cont' && !+inp.value ? 'auto' : inp.value; });
+      cfgInputs[k] = { inp, out }; box.appendChild(row);
+    }
+    const bar = document.createElement('div'); bar.className = 'btnrow';
+    bar.innerHTML = '<button type="button" id="bCfgSend">Send to cane</button>' +
+                    '<button type="button" id="bDemo">Feel the rhythms</button>' +
+                    '<button type="button" id="bCfgReset">Factory settings</button>';
+    box.appendChild(bar);
+    $('bCfgSend').addEventListener('click', () => {
+      const v = k => +cfgInputs[k].inp.value;
+      const s = { vibFar: v('vibFar'), cont: v('cont'), pulse: v('pulse'), gaps: [v('g0'), v('g1'), v('g2')], hold: v('hold') };
+      const err = checkCfg(s);
+      if (err) { logEvent('error', err); return; }
+      writeCfgBytes(cfgBytes(s), `settings sent: vibrate to ${s.vibFar} cm, continuous ${s.cont || 'auto'}, buzz ${s.pulse} ms, gaps ${s.gaps.join('/')} ms, hold ${s.hold} ms`);
+    });
+    $('bDemo').addEventListener('click', () => writeCfgBytes([1], 'rhythm demo: slow, medium, fast, continuous (2 s each)'));
+    $('bCfgReset').addEventListener('click', () => writeCfgBytes([2], 'factory settings restored'));
+    showCfg();
+  }
+  function showCfg() {
+    const c = caneCfg;
+    $('caneCfgInfo').textContent = !c
+      ? (VIEW ? 'cane settings: not received yet' : 'Connect the cane (firmware v4.5+) to read and change its settings.')
+      : `firmware v${(c.fw / 10).toFixed(1)}${c.bench ? ' BENCH' : ''}: buzz up to ${c.vibFar} cm, continuous below ${c.cont || c.tip + ' (tip)'} cm, ` +
+        `buzz ${c.pulse} ms, gaps ${c.gaps.join('/')} ms, hold ${c.hold} ms, senses to ${c.sense} cm`;
+    if (!c || VIEW) return;
+    const set = (k, v) => { if (cfgInputs[k]) { cfgInputs[k].inp.value = v; cfgInputs[k].out.textContent = k === 'cont' && !v ? 'auto' : v; } };
+    set('vibFar', c.vibFar); set('cont', c.cont); set('pulse', c.pulse);
+    set('g0', c.gaps[0]); set('g1', c.gaps[1]); set('g2', c.gaps[2]); set('hold', c.hold);
+  }
+
   function exportLog() {
     const data = {
       exported: new Date().toISOString(), model: detector && detector.name,
-      settings: { VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS, camScale },
+      settings: { VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS, camScale }, caneSettings: caneCfg,
       events, caneAheadCm: caneLog, caneDashboard: dbgHist,
       tracks: tracks.map(t => ({ id: t.id, cls: t.cls, votes: t.votes, dist: t.dist, src: t.fused ? 'cane' : t.src,
                                  bearing: t.bearing, lateral: t.lateral, inPath: t.inPath, why: t.why }))
@@ -933,7 +1049,7 @@
       v: 2, now: Date.now(), tracks: tracks.map(slim), raw: lastRawDets,
       W: video.videoWidth || 0, H: video.videoHeight || 0, running, caneConnected,
       model: detector ? detector.name : '', inferMs: stats.inferMs, fps: currentFps(), spoken: stats.spoken,
-      scaleN: stats.scaleN, pitchDown, camScale,
+      scaleN: stats.scaleN, pitchDown, camScale, caneCfg,
       set: { VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS },
       dbg: dbgHist.filter(q => q.t > since), cane: caneHist.filter(c => c[0] > since),
       ev: events.filter(e => e.t > since && e.type !== 'share').slice(-maxEv)
@@ -941,7 +1057,7 @@
   }
 
   // ---- viewer side ----
-  const remote = { W: 480, H: 640, fps: 0, model: '', last: 0, lastNow: 0, connected: false, dbgT: 0, caneT: 0, evT: 0 };
+  const remote = { W: 480, H: 640, fps: 0, model: '', last: 0, lastNow: 0, connected: false, dbgT: 0, caneT: 0, evT: 0, cfgJson: '' };
   function applyState(m) {
     if (Date.now() - remote.last > 3000)                // silence: a (new) phone may have a different clock
       Object.assign(remote, { lastNow: 0, dbgT: 0, caneT: 0, evT: 0 });
@@ -954,6 +1070,8 @@
     running = m.running; caneConnected = m.caneConnected;
     stats.inferMs = m.inferMs; stats.spoken = m.spoken; stats.scaleN = m.scaleN;
     pitchDown = m.pitchDown; camScale = m.camScale;
+    const cj = JSON.stringify(m.caneCfg || null);       // v4.5: cane settings, shown read-only
+    if (cj !== remote.cfgJson) { remote.cfgJson = cj; caneCfg = m.caneCfg || null; showCfg(); }
     ({ VFOV_DEG, CORRIDOR_HALF_M, CAM_OFFSET_M, CAM_H_M, SCORE_BIAS } = m.set);
     for (const q of m.dbg || []) {
       if (q.t <= remote.dbgT) continue;
@@ -1077,6 +1195,7 @@
     document.title = `Baston – dashboard (${VIEW})`;
     for (const id of ['bStart', 'bCane', 'bVoice']) $(id).style.display = 'none';
     $('controls').parentElement.style.display = 'none';
+    $('caneCfgCtl').style.display = 'none';
     $('view').previousElementSibling.textContent = 'Phone camera: detections only. No video leaves the phone (privacy rule).';
   }
   if (DEBUG) {
@@ -1088,7 +1207,7 @@
     bv.textContent = `Voice: ${USE_VOICE ? 'on' : 'off'}`;
     bv.addEventListener('click', () => { USE_VOICE = !USE_VOICE; bv.textContent = `Voice: ${USE_VOICE ? 'on' : 'off'}`; });
     $('bExport').addEventListener('click', exportLog);
-    if (!VIEW) buildControls();
+    if (!VIEW) { buildControls(); buildCaneCfg(); } else showCfg();
     requestAnimationFrame(dashLoop);
     logEvent('info', VIEW ? `viewer: waiting for the phone sharing "${VIEW}"`
                           : 'debug mode. Start camera, connect cane (Android/desktop Chrome), walk.');
